@@ -588,13 +588,18 @@ class TraceViewer:
     def _get_current_trace(self, sweep_index: int) -> tuple[np.ndarray, np.ndarray]:
         """Return (time, current_pA) for one sweep.
 
-        Uses the recorded current channel when available; otherwise synthesises
-        a clean step waveform from the epoch command levels.
+        Uses the recorded current channel when available; otherwise uses
+        pyabf's synthesised command waveform (sweepC), which correctly handles
+        step, ramp, and all other epoch types.
         """
         t, _, i = self._rec.get_sweep_arrays(sweep_index)
         if not np.all(np.isnan(i)):
             return t, i
-        # Synthesise from epoch commands
+        try:
+            return t, self._rec.get_command_waveform(sweep_index)
+        except Exception:
+            pass
+        # Last-resort fallback: flat steps from epoch levels
         i_synth = np.zeros(len(t))
         try:
             for ep in self._rec.get_epochs(sweep_index):

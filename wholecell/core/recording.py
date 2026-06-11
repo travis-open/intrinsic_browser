@@ -303,6 +303,27 @@ class Recording:
             )
         return epochs[epoch_index]
 
+    def get_command_waveform(self, sweep_index: int) -> np.ndarray:
+        """Return the synthesised DAC command waveform for one sweep.
+
+        Uses pyabf's ``sweepC``, which correctly handles all epoch types
+        (Step, Ramp, Pulse, etc.) by reading the protocol's epoch table.
+        This is the right source to use when no recorded current channel is
+        present in the file.
+
+        Parameters
+        ----------
+        sweep_index : int
+
+        Returns
+        -------
+        np.ndarray, shape (n_samples,)
+            Command waveform in the DAC units (pA for current clamp).
+        """
+        self._validate_sweep_index(sweep_index)
+        self._abf.setSweep(sweep_index)
+        return self._abf.sweepC.copy()
+
     def get_epoch_arrays(
         self,
         sweep_index: int,
