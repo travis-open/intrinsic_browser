@@ -42,6 +42,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 from wholecell.core.recording import Recording
@@ -568,26 +569,101 @@ class Cell:
     def export_sweep_summary(
         self,
         collection_name: str,
+        step_epoch_index: int,
         filepath: str | Path | None = None,
     ) -> pd.DataFrame:
         """Export the per-sweep summary table as a CSV.
 
-        Columns include: filename, sweep_index, n_spikes, max_firing_rate_hz,
-        current_injection_pA, mean_voltage_mV, and others populated by
-        analysis runs.
+        Always includes baseline_voltage_mV and step_current_pA for every
+        sweep (computed from the recording). Passive and spike metrics are
+        merged where available; columns are NaN-filled if not yet computed.
 
         Parameters
         ----------
         collection_name : str
+        step_epoch_index : int
+            Zero-based epoch index of the current step, used to compute
+            baseline (epoch before the step) and step current (sweepC mean
+            during the step).
         filepath : str or Path or None
+            Defaults to ``{output_dir}/{cell_id}_sweep_summary_{ts}.csv``.
 
         Returns
         -------
         pd.DataFrame
         """
-        raise NotImplementedError(
-            "export_sweep_summary: implementation pending analysis modules."
-        )
+        sc = self.get_collection(collection_name)
+
+        # Build base rows — always computed regardless of analysis state
+        rows: dict[tuple[str, int], dict] = {}
+        for ref in sc.sweeps:
+            rec = self.recordings[ref.filename]
+            rows[(ref.filename, ref.sweep_index)] = {
+                "filename": ref.filename,
+                "sweep_index": ref.sweep_index,
+                "display_label": ref.display_label,
+                "step_current_pA": _compute_sweep_step_current(
+                    rec, ref.sweep_index, step_epoch_index
+                ),
+                "baseline_voltage_mV": _compute_sweep_baseline(
+                    rec, ref.sweep_index, step_epoch_index
+                ),
+            }
+
+        # Merge passive results (most recent entry wins per sweep)
+        for entry in self.results.get("passive", []):
+            data = entry.get("data", {})
+            if data.get("type") == "averaged_passive":
+                # GUI-averaged result: same metrics assigned to all source sweeps
+                metrics = {k: data[k] for k in (
+                    "input_resistance_MOhm", "time_constant_ms",
+                    "sag_ratio", "sag_amplitude_mV", "sag_tau_ms",
+                ) if k in data}
+                for sw in data.get("source_sweeps", []):
+                    key = (sw["filename"], sw["sweep_index"])
+                    if key in rows:
+                        rows[key].update(metrics)
+            else:
+                # Per-sweep result from Cell.analyze_passive
+                for pr in data.get("per_sweep", []):
+                    key = (pr["filename"], pr["sweep_index"])
+                    if key in rows:
+                        rows[key].update({k: pr[k] for k in (
+                            "input_resistance_MOhm", "time_constant_ms",
+                            "sag_ratio", "sag_amplitude_mV", "sag_tau_ms",
+                        ) if k in pr})
+
+        # Merge spike results (most recent entry wins per sweep)
+        for entry in self.results.get("spikes", []):
+            data = entry.get("data", {})
+            for sr in data.get("per_sweep", []):
+                key = (sr["filename"], sr["sweep_index"])
+                if key in rows:
+                    rows[key]["n_spikes"] = sr.get("n_spikes", len(sr.get("spikes", [])))
+                    rows[key]["mean_firing_rate_hz"] = sr.get("mean_firing_rate_hz", float("nan"))
+
+        # Assemble in collection order
+        df = pd.DataFrame([rows[(ref.filename, ref.sweep_index)] for ref in sc.sweeps])
+
+        col_order = [
+            "filename", "sweep_index", "display_label",
+            "step_current_pA", "baseline_voltage_mV",
+            "input_resistance_MOhm", "time_constant_ms",
+            "sag_ratio", "sag_amplitude_mV", "sag_tau_ms",
+            "n_spikes", "mean_firing_rate_hz",
+        ]
+        present = [c for c in col_order if c in df.columns]
+        extra = [c for c in df.columns if c not in col_order]
+        df = df[present + extra]
+
+        if filepath is None:
+            ts = _timestamp().replace(":", "").replace("-", "").replace("T", "_")
+            filepath = self.output_dir / f"{self.cell_id}_sweep_summary_{ts}.csv"
+
+        df.to_csv(filepath, index=False)
+        self._log("export_sweep_summary", {"filepath": str(filepath), "collection": collection_name})
+        print(f"Sweep summary saved: {filepath}")
+        return df
 
     def export_cell_summary(
         self,
@@ -595,10 +671,9 @@ class Cell:
     ) -> dict:
         """Export cell-level summary scalars and curves to JSON.
 
-        The JSON structure is intentionally flexible: fixed scalars (Rin,
-        rheobase, first spike threshold) live at the top level; variable-
-        length data (full F-I curve, adaptation curves) live under named
-        keys. This accommodates cells with different numbers of current steps.
+        Writes whatever analysis results are available. Missing sections are
+        omitted rather than raising an error. Variable-length data (F-I curve,
+        adaptation curves) lives under named keys; fixed scalars at top level.
 
         Parameters
         ----------
@@ -610,9 +685,54 @@ class Cell:
         dict
             The exported summary dict.
         """
-        raise NotImplementedError(
-            "export_cell_summary: implementation pending analysis modules."
-        )
+        summary: dict = {
+            "cell_id": self.cell_id,
+            "notes": self.notes,
+            "exported_at": _timestamp(),
+        }
+
+        # Passive section
+        if self.results.get("passive"):
+            data = self.results["passive"][-1]["data"]
+            if data.get("type") == "averaged_passive":
+                summary["passive"] = {k: v for k, v in data.items()
+                                       if k not in ("type", "_tau_fit")}
+            else:
+                summary["passive"] = data.get("cell_level", {})
+                summary["passive"]["source"] = "per_sweep_average"
+
+        # Spike features section
+        if self.results.get("spike_features"):
+            data = self.results["spike_features"][-1]["data"]
+            spike_table = data.get("spike_table", [])
+            if spike_table:
+                thresholds = [s["threshold_voltage_mV"] for s in spike_table
+                              if not np.isnan(s.get("threshold_voltage_mV", float("nan")))]
+                half_widths = [s["half_width_ms"] for s in spike_table
+                               if not np.isnan(s.get("half_width_ms", float("nan")))]
+                first = spike_table[0]
+                summary["spikes"] = {
+                    "n_spikes_total": len(spike_table),
+                    "first_spike_threshold_mV": first.get("threshold_voltage_mV"),
+                    "first_spike_half_width_ms": first.get("half_width_ms"),
+                    "mean_threshold_mV": float(np.mean(thresholds)) if thresholds else None,
+                    "mean_half_width_ms": float(np.mean(half_widths)) if half_widths else None,
+                }
+
+        # F-I curve section
+        if self.results.get("fi_curve"):
+            summary["fi_curve"] = self.results["fi_curve"][-1]["data"]
+
+        if filepath is None:
+            filepath = self.output_dir / f"{self.cell_id}_cell_summary.json"
+        filepath = Path(filepath)
+
+        with open(filepath, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+        self._log("export_cell_summary", {"filepath": str(filepath)})
+        print(f"Cell summary saved: {filepath}")
+        return summary
 
     # ------------------------------------------------------------------
     # Session persistence
@@ -760,3 +880,37 @@ class Cell:
 def _timestamp() -> str:
     """ISO 8601 timestamp string for result versioning."""
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _compute_sweep_baseline(rec, sweep_index: int, step_epoch_index: int) -> float:
+    """Return mean baseline voltage from the epoch immediately before the step.
+
+    Falls back to the first 50 ms of the step epoch if no prior epoch exists.
+    """
+    if step_epoch_index > 0:
+        try:
+            ep = rec.get_epoch(sweep_index, step_epoch_index - 1)
+            _, v, _ = rec.get_sweep_arrays(sweep_index)
+            seg = v[ep.start_sample:ep.end_sample]
+            return float(np.mean(seg)) if len(seg) > 0 else float("nan")
+        except (IndexError, RuntimeError):
+            pass
+    try:
+        ep = rec.get_epoch(sweep_index, step_epoch_index)
+        _, v, _ = rec.get_sweep_arrays(sweep_index)
+        n_50ms = int(0.05 * rec.sampling_rate_hz)
+        seg = v[ep.start_sample:ep.start_sample + n_50ms]
+        return float(np.mean(seg)) if len(seg) > 0 else float("nan")
+    except Exception:
+        return float("nan")
+
+
+def _compute_sweep_step_current(rec, sweep_index: int, step_epoch_index: int) -> float:
+    """Return mean command current during the step epoch (from sweepC)."""
+    try:
+        cmd = rec.get_command_waveform(sweep_index)
+        ep = rec.get_epoch(sweep_index, step_epoch_index)
+        window = cmd[ep.start_sample:ep.end_sample]
+        return float(np.mean(window)) if len(window) > 0 else float("nan")
+    except Exception:
+        return float("nan")
