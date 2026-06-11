@@ -122,6 +122,16 @@ def _detect_in_sweep(
     epoch_start_s = epoch.start_time_s
     epoch_end_s = epoch.end_time_s
 
+    # If no recorded current channel (single-channel ABF), substitute the
+    # DAC command waveform (sweepC).  This correctly handles ramps, steps,
+    # and any other epoch shape — unlike epoch.level which is only the
+    # starting level of the epoch.
+    if np.all(np.isnan(current)):
+        try:
+            current = rec.get_command_waveform(ref.sweep_index)
+        except Exception:
+            pass
+
     # Determine current injection amplitude from the epoch
     current_pA = _epoch_mean_current(current, epoch.start_sample, epoch.end_sample)
 
@@ -141,13 +151,11 @@ def _detect_in_sweep(
         for i, sp in enumerate(epoch_spikes)
     ]
 
-    # Current injection at each spike's threshold sample.
-    # Falls back to the epoch command level when the recorded current channel
-    # is absent (single-channel ABF files return all-NaN for current).
+    # Current injection at each spike's threshold sample (instantaneous value
+    # from the command waveform — correct for both steps and ramps).
     for sd, sp in zip(spike_dicts, epoch_spikes):
         idx = min(sp.threshold_index, len(current) - 1)
-        val = float(current[idx])
-        sd["current_at_threshold_pA"] = val if not np.isnan(val) else float(epoch.level)
+        sd["current_at_threshold_pA"] = float(current[idx])
 
     # Slow AHP: minimum voltage between each spike and the next spike's
     # threshold (or the epoch end for the last spike).
