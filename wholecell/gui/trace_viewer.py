@@ -483,9 +483,9 @@ class TraceViewer:
             return
         self._current_collection = self._cell.collections[name]
 
-        # Auto-detect step epoch from first recording in collection
-        if self._step_epoch_index is None:
-            self._auto_detect_epoch()
+        # Re-detect step epoch every time the collection changes — different
+        # files may have different protocols with the step at a different index.
+        self._auto_detect_epoch()
 
         self._cursor = 0
         self._populate_sweep_list()
