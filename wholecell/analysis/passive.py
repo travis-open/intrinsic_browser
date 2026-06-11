@@ -177,7 +177,7 @@ def estimate_input_resistance(
     baseline_voltage_mV: float,
     epoch_voltage: np.ndarray,
     step_current_pA: float,
-    steady_state_window_fraction: float = 0.2,
+    steady_state_window_fraction: float = 0.1,
 ) -> float:
     """Estimate input resistance (MΩ) from a single current step sweep.
 
@@ -227,23 +227,25 @@ def fit_time_constant(
     epoch_time: np.ndarray,
     epoch_voltage: np.ndarray,
     baseline_voltage_mV: float,
-    fit_window_fraction: float = 0.4,
+    frac: float = 0.1,
 ) -> tuple[float, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Fit a single-exponential decay to the onset of a voltage step.
 
-    The fit is performed on the rising/falling edge immediately after step
-    onset (first ``fit_window_fraction`` of the epoch).
+    The fit window runs from where the voltage has deflected ``frac`` of the
+    way toward the peak deflection (fit start) to the time of the peak itself
+    (fit end), matching the approach used in the Allen ipfx library.
 
     Parameters
     ----------
     epoch_time : np.ndarray
-        Time array for the epoch, starting at 0 (s).
+        Time array for the epoch (s). Need not start at zero.
     epoch_voltage : np.ndarray
         Voltage trace for the epoch (mV).
     baseline_voltage_mV : float
         Pre-step voltage used as the asymptote (mV).
-    fit_window_fraction : float
-        Fraction of epoch used for the fit. Default: first 40%.
+    frac : float
+        Fraction of peak deflection from baseline that defines the start of
+        the fit window. Default: 0.1 (10 %).
 
     Returns
     -------
@@ -267,22 +269,45 @@ def fit_time_constant(
     if n < 10:
         return float("nan"), None, None, None
 
-    n_fit = max(10, int(n * fit_window_fraction))
-    t_win = epoch_time[:n_fit].copy()
-    v_win = epoch_voltage[:n_fit].copy()
+    # Determine step direction and find peak deflection index
+    mean_step_v = float(np.mean(epoch_voltage))
+    hyperpolarizing = mean_step_v < baseline_voltage_mV
+    peak_idx = int(np.argmin(epoch_voltage) if hyperpolarizing else np.argmax(epoch_voltage))
+    v_peak = float(epoch_voltage[peak_idx])
+
+    # Threshold: frac of the way from baseline to peak
+    threshold = frac * (v_peak - baseline_voltage_mV) + baseline_voltage_mV
+
+    # Find first sample that crosses the threshold (ipfx-style search)
+    if hyperpolarizing:
+        search = np.flatnonzero(epoch_voltage <= threshold)
+    else:
+        search = np.flatnonzero(epoch_voltage >= threshold)
+
+    if not search.size or search[0] >= peak_idx:
+        return float("nan"), None, None, None
+
+    fit_start_idx = int(search[0])
+    fit_end_idx = peak_idx
+
+    if fit_end_idx - fit_start_idx < 5:
+        return float("nan"), None, None, None
+
+    t_win = epoch_time[fit_start_idx:fit_end_idx + 1].copy()
+    v_win = epoch_voltage[fit_start_idx:fit_end_idx + 1].copy()
 
     # Re-zero time so t=0 at fit onset
     t0 = t_win[0]
     t_win = t_win - t0
 
     v0_guess = float(v_win[0])
-    v_ss_guess = float(np.mean(v_win[-max(1, n_fit // 5):]))
+    v_ss_guess = float(v_win[-1])
     # Estimate tau from 63% of the total deflection
     target = v0_guess + 0.632 * (v_ss_guess - v0_guess)
     crossings = np.where(
         (v_win[:-1] - target) * (v_win[1:] - target) <= 0
     )[0]
-    tau_guess = float(t_win[crossings[0]]) if len(crossings) else 0.01
+    tau_guess = float(t_win[crossings[0]]) if len(crossings) else float(t_win[-1]) * 0.3
 
     def _exp_model(t, v_ss, v0, tau):
         return v_ss + (v0 - v_ss) * np.exp(-t / tau)
