@@ -141,6 +141,12 @@ def _detect_in_sweep(
         for i, sp in enumerate(epoch_spikes)
     ]
 
+    # Current injection at each spike's threshold sample
+    for sd, sp in zip(spike_dicts, epoch_spikes):
+        idx = min(sp.threshold_index, len(current) - 1)
+        val = float(current[idx])
+        sd["current_at_threshold_pA"] = val if not np.isnan(val) else float("nan")
+
     # Slow AHP: minimum voltage between each spike and the next spike's
     # threshold (or the epoch end for the last spike).
     for i, sd in enumerate(spike_dicts):

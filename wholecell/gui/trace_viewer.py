@@ -1145,7 +1145,12 @@ class TraceViewer:
             )
             return
 
-        df = pd.DataFrame(rows).drop(columns=["display_label"], errors="ignore")
+        df = (
+            pd.DataFrame(rows)
+            .drop(columns=["display_label"], errors="ignore")
+            .sort_values(["filename", "sweep_index", "spike_index_in_sweep"])
+            .reset_index(drop=True)
+        )
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = self._cell.output_dir / f"{self._cell.cell_id}_spikes_{ts}.csv"
