@@ -226,12 +226,14 @@ class TraceViewer:
             symbol="o",  symbolSize=10, symbolBrush="#4f4", **_sp)   # ● green
         self._mk_trough = self._plot_v.plot(
             symbol="d",  symbolSize=10, symbolBrush="#f44", **_sp)   # ◆ red
+        self._mk_slow_ahp = self._plot_v.plot(
+            symbol="s",  symbolSize=10, symbolBrush="#88f", **_sp)   # ■ blue
         self._mk_upstroke = self._plot_d.plot(
             symbol="t",  symbolSize=11, symbolBrush="#0ff", **_sp)   # ▲ cyan
         self._mk_downstroke = self._plot_d.plot(
             symbol="t1", symbolSize=11, symbolBrush="#f4f", **_sp)   # ▼ magenta
         for mk in (self._mk_threshold, self._mk_peak, self._mk_trough,
-                   self._mk_upstroke, self._mk_downstroke):
+                   self._mk_slow_ahp, self._mk_upstroke, self._mk_downstroke):
             mk.setZValue(20)
 
         # Per-sweep curve sets
@@ -397,7 +399,7 @@ class TraceViewer:
 
         if not visible:
             for mk in (self._mk_threshold, self._mk_peak, self._mk_trough,
-                       self._mk_upstroke, self._mk_downstroke):
+                       self._mk_slow_ahp, self._mk_upstroke, self._mk_downstroke):
                 mk.setData([], [])
             return
 
@@ -405,6 +407,7 @@ class TraceViewer:
         thresh_t, thresh_v = [], []
         peak_t, peak_v = [], []
         trough_t, trough_v = [], []
+        slow_ahp_t, slow_ahp_v = [], []
         up_t, up_dvdt = [], []
         dn_t, dn_dvdt = [], []
 
@@ -431,6 +434,12 @@ class TraceViewer:
                 trough_t.append(sp["trough_time_s"])
                 trough_v.append(sp["trough_voltage_mV"])
 
+                ahp_t = sp.get("slow_ahp_time_s")
+                ahp_v = sp.get("slow_ahp_voltage_mV")
+                if ahp_t is not None and not np.isnan(ahp_t):
+                    slow_ahp_t.append(ahp_t)
+                    slow_ahp_v.append(ahp_v)
+
                 if dvdt is not None:
                     # Upstroke: max dV/dt between threshold and peak
                     i0 = sp.get("threshold_index",
@@ -454,6 +463,7 @@ class TraceViewer:
         self._mk_threshold.setData(thresh_t, thresh_v)
         self._mk_peak.setData(peak_t, peak_v)
         self._mk_trough.setData(trough_t, trough_v)
+        self._mk_slow_ahp.setData(slow_ahp_t, slow_ahp_v)
         self._mk_upstroke.setData(up_t, up_dvdt)
         self._mk_downstroke.setData(dn_t, dn_dvdt)
 

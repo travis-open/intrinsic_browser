@@ -141,6 +141,24 @@ def _detect_in_sweep(
         for i, sp in enumerate(epoch_spikes)
     ]
 
+    # Slow AHP: minimum voltage between each spike and the next spike's
+    # threshold (or the epoch end for the last spike).
+    for i, sd in enumerate(spike_dicts):
+        start = epoch_spikes[i].trough_index
+        if i + 1 < len(epoch_spikes):
+            end = epoch_spikes[i + 1].threshold_index
+        else:
+            end = epoch.end_sample
+        end = min(end, len(voltage))
+        if end > start:
+            rel = int(np.argmin(voltage[start:end]))
+            ahp_idx = start + rel
+            sd["slow_ahp_voltage_mV"] = float(voltage[ahp_idx])
+            sd["slow_ahp_time_s"] = float(time[ahp_idx])
+        else:
+            sd["slow_ahp_voltage_mV"] = float("nan")
+            sd["slow_ahp_time_s"] = float("nan")
+
     return {
         "filename": ref.filename,
         "sweep_index": ref.sweep_index,
