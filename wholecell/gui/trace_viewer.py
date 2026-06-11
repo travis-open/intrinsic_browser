@@ -296,6 +296,10 @@ class TraceViewer:
                    self._mk_slow_ahp, self._mk_upstroke, self._mk_downstroke):
             mk.setZValue(20)
 
+        # Auto-create a default collection for every loaded recording
+        # so sweeps are visible immediately without manual tree interaction.
+        self._auto_create_collections(list(self._cell.recordings.keys()))
+
         # Populate file tree and collections from Cell state
         self._build_file_tree()
         self._update_collections_combo()
@@ -390,6 +394,21 @@ class TraceViewer:
             for i in range(item.childCount()):
                 item.child(i).setCheckState(0, state)
         self._file_tree.blockSignals(False)
+
+    def _auto_create_collections(self, stems: list[str]) -> None:
+        """Create a default all-sweeps collection for each stem that lacks one."""
+        for stem in stems:
+            if stem not in self._cell.recordings:
+                continue
+            if stem in self._cell.collections:
+                continue
+            rec = self._cell.recordings[stem]
+            sweeps = [{"filename": stem, "sweep_index": i}
+                      for i in range(rec.n_sweeps)]
+            try:
+                self._cell.create_sweep_collection(stem, sweeps)
+            except Exception:
+                pass
 
     def _on_add_to_collection(self) -> None:
         """Collect checked sweep tree items and create a SweepCollection."""
@@ -1056,8 +1075,19 @@ class TraceViewer:
 
         self._cell.output_dir = Path(dir_path)
 
+        # Auto-create a default collection for each newly loaded file
+        self._auto_create_collections(loaded)
+
         self._build_file_tree()
         self._update_collections_combo()
+
+        # Switch to the first newly created collection if none is active
+        if loaded and self._current_collection is None:
+            first = loaded[0]
+            idx = self._collections_combo.findText(first)
+            if idx >= 0:
+                self._collections_combo.setCurrentIndex(idx)
+            self._on_collection_changed(first)
 
         msg = f"Loaded {len(loaded)} file(s)."
         if errors:
