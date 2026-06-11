@@ -200,6 +200,23 @@ class TraceViewer:
         btn_row.addWidget(btn_none)
         left_layout.addLayout(btn_row)
 
+        thresh_row = QtWidgets.QHBoxLayout()
+        thresh_lbl = QtWidgets.QLabel("dV/dt thresh:")
+        thresh_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._dvdt_spin = QtWidgets.QDoubleSpinBox()
+        self._dvdt_spin.setRange(1.0, 200.0)
+        self._dvdt_spin.setSingleStep(1.0)
+        self._dvdt_spin.setDecimals(1)
+        self._dvdt_spin.setValue(20.0)
+        self._dvdt_spin.setSuffix(" mV/ms")
+        self._dvdt_spin.setStyleSheet(
+            "QDoubleSpinBox { background: #1a1a1a; color: #ddd; font-size: 11px; "
+            "border: 1px solid #444; padding: 2px; }"
+        )
+        thresh_row.addWidget(thresh_lbl)
+        thresh_row.addWidget(self._dvdt_spin, stretch=1)
+        left_layout.addLayout(thresh_row)
+
         btn_spikes = QtWidgets.QPushButton("Find Spikes  (S = toggle)")
         btn_spikes.setStyleSheet(
             "font-size: 11px; padding: 4px; background: #2a2a4a; color: #aaf;"
@@ -663,8 +680,12 @@ class TraceViewer:
         )
 
         epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
+        dvdt_thresh = self._dvdt_spin.value()
         try:
-            result = run_spike_detection(col, epoch_index=epoch_idx)
+            result = run_spike_detection(
+                col, epoch_index=epoch_idx,
+                dvdt_detection_mVms=dvdt_thresh,
+            )
         except Exception as exc:
             self._results_box.setPlainText(f"Spike detection error:\n{exc}")
             return
@@ -673,6 +694,7 @@ class TraceViewer:
         params = {
             "collection_name": self._current_collection.name,
             "epoch_index": epoch_idx,
+            "dvdt_detection_mVms": dvdt_thresh,
             "source_sweeps": [{"filename": r.filename, "sweep_index": r.sweep_index}
                                for r in refs],
         }
@@ -1102,17 +1124,34 @@ class TraceViewer:
             self._results_box.setPlainText(f"Save failed:\n{exc}")
 
     def _on_export_spike_table(self) -> None:
+        import pandas as pd
+        from datetime import datetime
         from pyqtgraph.Qt import QtWidgets
 
-        if not self._cell.results.get("spike_features"):
+        if not self._spike_data:
             QtWidgets.QMessageBox.information(
-                self._win, "No spike features",
-                "Run spike detection and feature extraction first."
+                self._win, "No spikes detected",
+                "Run spike detection first (Find Spikes button)."
             )
             return
+
+        rows = []
+        for spikes in self._spike_data.values():
+            rows.extend(spikes)
+
+        if not rows:
+            QtWidgets.QMessageBox.information(
+                self._win, "No spikes", "No spikes detected in any sweep."
+            )
+            return
+
+        df = pd.DataFrame(rows).drop(columns=["display_label"], errors="ignore")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = self._cell.output_dir / f"{self._cell.cell_id}_spikes_{ts}.csv"
         try:
-            path = self._cell.export_spike_table()
-            self._results_box.setPlainText(f"Spike table saved:\n{path}")
+            df.to_csv(filepath, index=False)
+            self._results_box.setPlainText(f"Spike table saved:\n{filepath}")
         except Exception as exc:
             self._results_box.setPlainText(f"Export failed:\n{exc}")
 
