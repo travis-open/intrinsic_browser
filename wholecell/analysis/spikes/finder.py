@@ -6,11 +6,10 @@ Collection-level spike detection runner. Called by Cell.find_spikes.
 Responsibilities
 ~~~~~~~~~~~~~~~~
 - Iterate over all sweeps in a SweepCollection
-- Slice voltage/current to the user-specified epoch window
 - Dispatch to the chosen SpikeFinder backend
-- Filter detections to only those within the epoch window (excludes
-  spontaneous spikes outside the current injection epoch)
-- Return a result dict ready for Cell._store_result
+- Return ALL detected spikes, each annotated with the epoch they fall in
+- Epoch-based filtering is intentionally NOT done here — it is the caller's
+  responsibility (e.g. run_fi_analysis filters to the stimulus epoch)
 """
 
 from __future__ import annotations
@@ -30,18 +29,20 @@ def run_spike_detection(
     lowpass_hz: float | None = None,
     **spike_finder_kwargs: Any,
 ) -> dict:
-    """Detect spikes in a SweepCollection within a specific epoch.
+    """Detect spikes in all sweeps of a SweepCollection.
 
-    Only spikes whose threshold crossing occurs within the epoch time window
-    are included in the results. This excludes spontaneous spikes that happen
-    outside the current injection window.
+    All spikes found in each sweep are returned regardless of epoch.
+    Each spike dict includes ``epoch_at_threshold`` (which epoch the threshold
+    crossing falls in) and ``latency_to_epoch_onset_ms`` (time from that
+    epoch's start).  Downstream callers can filter by epoch as needed.
 
     Parameters
     ----------
     collection : SweepCollection
     epoch_index : int
-        Zero-based epoch index for the current injection window. Fails
-        loudly if epoch cannot be parsed from any sweep.
+        Zero-based epoch index for the reference current injection window.
+        Used only to compute ``current_injection_pA`` per sweep — NOT used
+        to filter spikes. Fails loudly if epoch cannot be parsed.
     backend : str
         ``"derivative"`` or ``"ipfx"``.
     lowpass_hz : float or None
@@ -54,18 +55,24 @@ def run_spike_detection(
     dict with keys:
         - ``"backend"`` (str)
         - ``"backend_params"`` (dict): all detection parameters, for audit log
+        - ``"epoch_index"`` (int): the reference epoch index
         - ``"per_sweep"`` (list of dict): one entry per sweep, each with:
             - ``"filename"`` (str)
             - ``"sweep_index"`` (int)
             - ``"display_label"`` (str)
             - ``"epoch_index"`` (int)
-            - ``"epoch_start_s"`` (float)
-            - ``"epoch_end_s"`` (float)
-            - ``"current_injection_pA"`` (float)
-            - ``"n_spikes"`` (int)
-            - ``"spikes"`` (list of dict): one dict per spike, with all
-              SpikeDetection fields as keys. ``filename`` and ``sweep_index``
-              are included in every spike dict for downstream export.
+            - ``"epoch_start_s"`` (float) — reference epoch start
+            - ``"epoch_end_s"`` (float) — reference epoch end
+            - ``"current_injection_pA"`` (float) — mean current in reference epoch
+            - ``"n_spikes"`` (int) — total spikes detected in sweep
+            - ``"spikes"`` (list of dict): one dict per spike with all
+              SpikeDetection fields plus:
+                ``epoch_at_threshold`` (int or None),
+                ``latency_to_epoch_onset_ms`` (float, NaN if outside all epochs),
+                ``sweep_current_injection_pA`` (float),
+                ``current_at_threshold_pA`` (float),
+                ``slow_ahp_voltage_mV`` (float),
+                ``slow_ahp_time_s`` (float)
 
     Raises
     ------
@@ -98,13 +105,14 @@ def _detect_in_sweep(
     finder,
     lowpass_hz: float | None,
 ) -> dict:
-    """Run spike detection for one sweep and filter to the epoch window.
+    """Run spike detection for one sweep and annotate spikes with epoch info.
 
     Parameters
     ----------
     collection : SweepCollection
     ref : SweepRef
     epoch_index : int
+        Reference epoch for current amplitude measurement only.
     finder : SpikeFinder
     lowpass_hz : float or None
 
@@ -113,56 +121,38 @@ def _detect_in_sweep(
     dict
         Per-sweep result dict (see run_spike_detection docstring).
     """
-    # Get full sweep arrays (voltage filtered if lowpass_hz is set)
     time, voltage, current = collection.get_sweep_arrays(ref, lowpass_hz=lowpass_hz)
 
-    # Get epoch boundaries — fails loudly if epochs cannot be parsed
     rec = collection._recordings[ref.filename]
     epoch = rec.get_epoch(ref.sweep_index, epoch_index)
     epoch_start_s = epoch.start_time_s
     epoch_end_s = epoch.end_time_s
 
-    # If no recorded current channel (single-channel ABF), substitute the
-    # DAC command waveform (sweepC).  This correctly handles ramps, steps,
-    # and any other epoch shape — unlike epoch.level which is only the
-    # starting level of the epoch.
     if np.all(np.isnan(current)):
         try:
             current = rec.get_command_waveform(ref.sweep_index)
         except Exception:
             pass
 
-    # Determine current injection amplitude from the epoch
     current_pA = _epoch_mean_current(current, epoch.start_sample, epoch.end_sample)
 
-    # Run detection on the FULL sweep (backend sees complete trace)
-    # Filtering to epoch window happens below — this mirrors IPFX behaviour
-    # and avoids edge effects from slicing before detection.
     all_spikes = finder.detect(time, voltage, current)
-
-    # Filter: only keep spikes whose threshold crossing is within the epoch
-    epoch_spikes = [
-        sp for sp in all_spikes
-        if epoch_start_s <= sp.threshold_time_s < epoch_end_s
-    ]
 
     spike_dicts = [
         _spike_to_dict(sp, ref, i)
-        for i, sp in enumerate(epoch_spikes)
+        for i, sp in enumerate(all_spikes)
     ]
 
-    # Current injection at each spike's threshold sample (instantaneous value
-    # from the command waveform — correct for both steps and ramps).
-    for sd, sp in zip(spike_dicts, epoch_spikes):
+    for sd, sp in zip(spike_dicts, all_spikes):
         idx = min(sp.threshold_index, len(current) - 1)
         sd["current_at_threshold_pA"] = float(current[idx])
 
-    # Slow AHP: minimum voltage between each spike and the next spike's
-    # threshold (or the epoch end for the last spike).
+    # Slow AHP: minimum voltage between each spike's trough and the next
+    # spike's threshold (or the reference epoch end for the last spike).
     for i, sd in enumerate(spike_dicts):
-        start = epoch_spikes[i].trough_index
-        if i + 1 < len(epoch_spikes):
-            end = epoch_spikes[i + 1].threshold_index
+        start = all_spikes[i].trough_index
+        if i + 1 < len(all_spikes):
+            end = all_spikes[i + 1].threshold_index
         else:
             end = epoch.end_sample
         end = min(end, len(voltage))
@@ -174,6 +164,20 @@ def _detect_in_sweep(
         else:
             sd["slow_ahp_voltage_mV"] = float("nan")
             sd["slow_ahp_time_s"] = float("nan")
+
+    # Annotate each spike with its epoch and latency to that epoch's onset.
+    all_epochs = rec.get_epochs(ref.sweep_index)
+    for sd, sp in zip(spike_dicts, all_spikes):
+        ep_info = _find_epoch_at_time(all_epochs, sp.threshold_time_s)
+        if ep_info is not None:
+            sd["epoch_at_threshold"] = ep_info.epoch_index
+            sd["latency_to_epoch_onset_ms"] = (
+                sp.threshold_time_s - ep_info.start_time_s
+            ) * 1000.0
+        else:
+            sd["epoch_at_threshold"] = None
+            sd["latency_to_epoch_onset_ms"] = float("nan")
+        sd["sweep_current_injection_pA"] = current_pA
 
     return {
         "filename": ref.filename,
@@ -193,19 +197,12 @@ def _spike_to_dict(
     ref: SweepRef,
     spike_index_in_sweep: int,
 ) -> dict:
-    """Convert a SpikeDetection to a flat dict for export.
-
-    ``filename`` and ``sweep_index`` are always present as separate atomic
-    fields so downstream users never need to parse compound identifiers.
-    ``display_label`` is included for GUI use only.
-    """
+    """Convert a SpikeDetection to a flat dict for export."""
     return {
-        # Identity — always separate, never compound
         "filename": ref.filename,
         "sweep_index": ref.sweep_index,
         "spike_index_in_sweep": spike_index_in_sweep,
         "display_label": ref.display_label,
-        # Detection outputs
         "peak_time_s": spike.peak_time_s,
         "peak_voltage_mV": spike.peak_voltage_mV,
         "threshold_time_s": spike.threshold_time_s,
@@ -214,6 +211,14 @@ def _spike_to_dict(
         "trough_voltage_mV": spike.trough_voltage_mV,
         "backend": spike.backend,
     }
+
+
+def _find_epoch_at_time(epochs: list, time_s: float):
+    """Return the EpochInfo whose window contains time_s, or None."""
+    for ep in epochs:
+        if ep.start_time_s <= time_s < ep.end_time_s:
+            return ep
+    return None
 
 
 def _epoch_mean_current(

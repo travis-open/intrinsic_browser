@@ -236,12 +236,26 @@ class TraceViewer:
         btn_spikes.clicked.connect(self._run_spike_detection)
         left_layout.addWidget(btn_spikes)
 
+        btn_fi = QtWidgets.QPushButton("F-I Curve")
+        btn_fi.setStyleSheet(
+            "font-size: 11px; padding: 4px; background: #2a3a4a; color: #8cf;"
+        )
+        btn_fi.clicked.connect(self._show_fi_curve)
+        left_layout.addWidget(btn_fi)
+
         btn_avg = QtWidgets.QPushButton("Average && Analyze Subthreshold")
         btn_avg.setStyleSheet(
             "font-size: 11px; padding: 4px; background: #2a4a2a; color: #8f8;"
         )
         btn_avg.clicked.connect(self._run_average_analysis)
         left_layout.addWidget(btn_avg)
+
+        btn_passive = QtWidgets.QPushButton("Analyze Each Sweep (Passive)")
+        btn_passive.setStyleSheet(
+            "font-size: 11px; padding: 4px; background: #2a4a3a; color: #8fb;"
+        )
+        btn_passive.clicked.connect(self._run_per_sweep_passive_analysis)
+        left_layout.addWidget(btn_passive)
 
         btn_clear = QtWidgets.QPushButton("Clear Plot")
         btn_clear.setStyleSheet("font-size: 11px; padding: 3px;")
@@ -749,6 +763,58 @@ class TraceViewer:
         self._show_spikes = True
         self._update_spike_markers()
 
+    def _show_fi_curve(self) -> None:
+        from pyqtgraph.Qt import QtWidgets
+        from wholecell.analysis.fi_curve import run_fi_analysis
+        from wholecell.gui.fi_viewer import FICurveViewer
+
+        if self._current_collection is None:
+            self._results_box.setPlainText("No active collection.")
+            return
+
+        spikes_results = self._cell.results.get("spikes", [])
+        if not spikes_results:
+            self._results_box.setPlainText(
+                "No spike detection results found.\nRun Find Spikes first."
+            )
+            return
+
+        epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
+        spike_entry = spikes_results[-1]
+        try:
+            fi_result = run_fi_analysis(
+                self._current_collection, epoch_idx, spike_entry
+            )
+        except Exception as exc:
+            self._results_box.setPlainText(f"F-I analysis error:\n{exc}")
+            return
+
+        self._cell._store_result("fi_curve", fi_result, {
+            "collection_name": self._current_collection.name,
+            "epoch_index": epoch_idx,
+            "source": "trace_viewer",
+        })
+
+        cell_level = fi_result.get("cell_level", {})
+        rheobase = cell_level.get("rheobase_pA", float("nan"))
+        max_rate = cell_level.get("max_firing_rate_hz", float("nan"))
+        slope = cell_level.get("fi_slope_hz_per_pA", float("nan"))
+
+        msg_parts = []
+        if rheobase == rheobase:  # not NaN
+            msg_parts.append(f"Rheobase: {rheobase:.0f} pA")
+        if max_rate == max_rate:
+            msg_parts.append(f"Max rate: {max_rate:.1f} Hz")
+        if slope == slope:
+            msg_parts.append(f"F-I slope: {slope:.4f} Hz/pA")
+        self._results_box.setPlainText("\n".join(msg_parts) if msg_parts else "F-I analysis complete.")
+
+        self._fi_viewer = FICurveViewer(
+            fi_result=fi_result,
+            title=f"{self._cell.cell_id} — F-I Curve",
+        )
+        self._fi_viewer.show()
+
     def _update_spike_markers(self) -> None:
         visible = self._show_spikes and bool(self._spike_data)
 
@@ -944,7 +1010,7 @@ class TraceViewer:
 
         # Run analysis
         rin = estimate_input_resistance(baseline_voltage, ep_voltage, step_current_pA)
-        tau_ms, fit_t, fit_v, fit_pred = fit_time_constant(
+        tau_ms, fit_t, fit_v, fit_pred, tau_r2 = fit_time_constant(
             ep_time, ep_voltage, baseline_voltage
         )
         sag = estimate_sag(ep_time, ep_voltage, baseline_voltage)
@@ -973,6 +1039,7 @@ class TraceViewer:
             "baseline_voltage_mV": float(baseline_voltage),
             "input_resistance_MOhm": float(rin),
             "time_constant_ms": float(tau_ms),
+            "time_constant_r2": float(tau_r2),
             "sag_ratio": float(sag["sag_ratio"]),
             "sag_amplitude_mV": float(sag["sag_amplitude_mV"]),
             "sag_tau_ms": float(sag["sag_tau_ms"]),
@@ -995,12 +1062,123 @@ class TraceViewer:
             f"Baseline voltage  : {baseline_voltage:.1f} mV",
             "─" * 28,
             f"Rin               : {rin:.1f} MΩ",
-            f"τ_m               : {tau_ms:.2f} ms",
+            f"τ_m               : {tau_ms:.2f} ms  (R²={tau_r2:.3f})",
             f"Sag ratio         : {sag['sag_ratio']:.3f}",
             f"Sag amplitude     : {sag['sag_amplitude_mV']:.2f} mV",
             f"Sag τ             : {sag['sag_tau_ms']:.1f} ms",
         ]
         self._results_box.setPlainText("\n".join(lines))
+
+    def _run_per_sweep_passive_analysis(self) -> None:
+        """Analyze each checked sweep individually (no averaging).
+
+        Unlike 'Average & Analyze Subthreshold', sweeps may have different
+        step amplitudes. Each sweep is analyzed independently and all results
+        are displayed in a per-sweep table.
+        """
+        from pyqtgraph.Qt import QtWidgets
+        from wholecell.core.sweep_collection import SweepCollection, SweepRef
+        from wholecell.analysis.passive import run_passive_analysis
+
+        if self._current_collection is None:
+            self._results_box.setPlainText("No active collection.")
+            return
+
+        checked = self._checked_sweeps()
+        if not checked:
+            self._results_box.setPlainText("No sweeps checked.")
+            return
+
+        # Warn (but don't block) if any checked sweep appears to spike
+        spiking = [pos for pos in checked
+                   if self._spike_data.get(
+                       (self._ref_at(pos).filename, self._ref_at(pos).sweep_index)
+                   )]
+        if not spiking:
+            spiking = self._detect_spiking_sweeps(checked)
+        if spiking:
+            spiking_labels = [self._ref_at(p).display_label for p in spiking]
+            reply = QtWidgets.QMessageBox.warning(
+                self._win,
+                "Spiking sweeps selected",
+                f"Sweep(s) {spiking_labels} appear to contain action potentials.\n\n"
+                "Passive analysis on spiking data will give unreliable results.\n\n"
+                "Proceed anyway?",
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+        refs = [self._ref_at(pos) for pos in checked]
+        col = SweepCollection(
+            name="_viewer_passive_sweep_temp",
+            sweeps=refs,
+            recordings=self._cell.recordings,
+        )
+
+        epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
+        lowpass = self._default_lowpass_hz if self._filter_on else None
+
+        try:
+            result = run_passive_analysis(col, epoch_idx, lowpass_hz=lowpass)
+        except Exception as exc:
+            self._results_box.setPlainText(f"Per-sweep passive analysis error:\n{exc}")
+            return
+
+        params = {
+            "collection_name": self._current_collection.name,
+            "epoch_index": epoch_idx,
+            "lowpass_hz": lowpass,
+            "n_sweeps": len(checked),
+            "source": "per_sweep_passive",
+        }
+        self._cell._store_result("passive", result, params)
+
+        # Build per-sweep display table
+        per_sweep = result.get("per_sweep", [])
+        filt_str = f"LP {lowpass:.0f} Hz" if lowpass else "raw"
+
+        hdr = f"{'Sw':>3}  {'I(pA)':>7}  {'Rin_SS':>7}  {'Rin_pk':>7}  {'τ(ms)':>7}  {'R²τ':>5}  {'Sag':>5}"
+        sep = "─" * len(hdr)
+        rows_txt = [f"N={len(per_sweep)}  Filter={filt_str}", sep, hdr, sep]
+
+        rin_vals, tau_vals = [], []
+        for r in per_sweep:
+            sw = r.get("sweep_index", "?")
+            i_pA = r.get("current_injection_pA", float("nan"))
+            rin_ss = r.get("input_resistance_MOhm", float("nan"))
+            rin_pk = r.get("input_resistance_peak_MOhm", float("nan"))
+            tau = r.get("time_constant_ms", float("nan"))
+            r2 = r.get("time_constant_r2", float("nan"))
+            sag = r.get("sag_ratio", float("nan"))
+
+            def _fmt(v, fmt=".1f"):
+                return f"{v:{fmt}}" if v == v else "  NaN"  # NaN check
+
+            rows_txt.append(
+                f"{sw:>3}  {_fmt(i_pA):>7}  {_fmt(rin_ss):>7}  "
+                f"{_fmt(rin_pk):>7}  {_fmt(tau):>7}  {_fmt(r2, '.3f'):>5}  "
+                f"{_fmt(sag, '.3f'):>5}"
+            )
+            if rin_ss == rin_ss:
+                rin_vals.append(rin_ss)
+            if tau == tau:
+                tau_vals.append(tau)
+
+        rows_txt.append(sep)
+        if rin_vals:
+            import statistics
+            rin_mean = sum(rin_vals) / len(rin_vals)
+            rin_sd = statistics.stdev(rin_vals) if len(rin_vals) > 1 else 0.0
+            rows_txt.append(f"Rin_SS mean ± SD : {rin_mean:.1f} ± {rin_sd:.1f} MΩ")
+        if tau_vals:
+            tau_mean = sum(tau_vals) / len(tau_vals)
+            tau_sd = statistics.stdev(tau_vals) if len(tau_vals) > 1 else 0.0
+            rows_txt.append(f"τ_m    mean ± SD : {tau_mean:.2f} ± {tau_sd:.2f} ms")
+
+        self._results_box.setPlainText("\n".join(rows_txt))
 
     # ------------------------------------------------------------------
     # Analysis helpers

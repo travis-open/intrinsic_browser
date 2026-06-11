@@ -23,6 +23,18 @@ import numpy as np
 from wholecell.core.sweep_collection import SweepCollection, SweepRef
 
 
+# Columns excluded from auto-collect when building first_spike_* cell features.
+# These are identity/metadata fields, not numeric measurements.
+_SPIKE_IDENTITY_COLUMNS = frozenset({
+    "filename",
+    "sweep_index",
+    "spike_index_in_sweep",
+    "display_label",
+    "backend",
+    "epoch_at_threshold",
+})
+
+
 # ---------------------------------------------------------------------------
 # Public entry point (called by Cell.extract_spike_features)
 # ---------------------------------------------------------------------------
@@ -31,6 +43,7 @@ def run_feature_extraction(
     collection: SweepCollection,
     spike_result: dict,
     lowpass_hz: float | None = None,
+    stimulus_epoch_index: int | None = None,
 ) -> dict:
     """Extract per-spike features for all spikes in a detection result.
 
@@ -41,37 +54,26 @@ def run_feature_extraction(
         Output of ``run_spike_detection`` (the ``"data"`` field of the
         timestamped result stored on Cell).
     lowpass_hz : float or None
-        Lowpass filter applied to voltage before feature extraction. Applied
-        independently of any filter used during detection.
+        Lowpass filter applied to voltage before feature extraction.
+    stimulus_epoch_index : int or None
+        If provided, cell-level summary features (rheobase, first-AP
+        features, adaptation index) are computed only from spikes in this
+        epoch. Pass the same epoch_index used for spike detection /
+        F-I analysis.
 
     Returns
     -------
     dict with keys:
         - ``"spike_table"`` (list of dict): one dict per spike, suitable for
-          pd.DataFrame construction. Columns:
+          pd.DataFrame construction. All spikes are included (no epoch
+          filtering). Columns include all detection carry-overs, extracted
+          shape features, plus ``epoch_at_threshold`` and
+          ``latency_to_epoch_onset_ms`` from the finder step.
 
-          Always present:
-            ``filename``, ``sweep_index``, ``spike_index_in_sweep``
-            ``display_label`` (GUI label, not a key)
-
-          Detection carry-overs:
-            ``peak_time_s``, ``peak_voltage_mV``
-            ``threshold_time_s``, ``threshold_voltage_mV``
-            ``trough_time_s``, ``trough_voltage_mV``
-
-          Extracted features:
-            ``height_mV``             spike height (peak - threshold)
-            ``half_width_ms``         width at half-maximum amplitude
-            ``ahp_depth_mV``          after-hyperpolarisation depth
-                                      (threshold_voltage - trough_voltage)
-            ``rise_time_ms``          threshold to peak
-            ``decay_time_ms``         peak to trough
-            ``upstroke_mVms``         max dV/dt during upstroke
-            ``downstroke_mVms``       min dV/dt during downstroke
-
-        - ``"cell_level"`` (dict): across-cell summary scalars:
-            ``first_spike_threshold_mV``, ``first_spike_peak_mV``,
-            ``mean_half_width_ms``, and adaptation index.
+        - ``"cell_level"`` (dict): across-cell summary scalars including
+          ``first_spike_*`` fields auto-collected from all numeric spike-table
+          columns (excluding identity columns) for the first evoked AP, plus
+          ``adaptation_index`` and ``mean_half_width_ms``.
     """
     spike_table: list[dict] = []
 
@@ -94,7 +96,9 @@ def run_feature_extraction(
             row = {**spike_dict, **features}
             spike_table.append(row)
 
-    cell_level = _compute_cell_level_features(spike_table)
+    cell_level = _compute_cell_level_features(
+        spike_table, stimulus_epoch_index=stimulus_epoch_index
+    )
 
     return {
         "spike_table": spike_table,
@@ -264,57 +268,100 @@ def _time_to_index(time: np.ndarray, target_s: float) -> int:
 # Cell-level feature summary
 # ---------------------------------------------------------------------------
 
-def _compute_cell_level_features(spike_table: list[dict]) -> dict:
+def _compute_cell_level_features(
+    spike_table: list[dict],
+    stimulus_epoch_index: int | None = None,
+) -> dict:
     """Compute across-cell summary features from the spike table.
+
+    When ``stimulus_epoch_index`` is provided, first-AP features and rheobase
+    are determined from spikes in that epoch only:
+      1. Filter to stimulus epoch spikes.
+      2. Find the rheobase sweep (minimum sweep_current_injection_pA with ≥1 spike).
+      3. Find the first evoked AP (earliest threshold_time_s in that sweep).
+      4. Auto-collect all numeric fields from that spike, prefixed with
+         ``first_spike_``. Identity columns (see _SPIKE_IDENTITY_COLUMNS) are
+         excluded. This auto-collection picks up future spike-table columns
+         automatically without requiring code changes here.
+
+    Adaptation index is computed from the sweep (within the stimulus epoch,
+    if specified) that has the most spikes.
 
     Parameters
     ----------
     spike_table : list of dict
-
-    Returns
-    -------
-    dict with keys:
-        ``first_spike_threshold_mV``, ``first_spike_peak_mV``,
-        ``mean_half_width_ms``, ``adaptation_index``.
-
-    Notes
-    -----
-    First spike features use the spike with the earliest ``threshold_time_s``
-    across all sweeps.
-
-    Adaptation index = (ISI_last - ISI_first) / (ISI_last + ISI_first)
-    computed within the sweep with the most spikes.
-
-    TODO: implement adaptation index calculation.
+    stimulus_epoch_index : int or None
     """
     if not spike_table:
         return {}
 
-    # Sort by threshold time to find first spike
-    sorted_spikes = sorted(spike_table, key=lambda r: r.get("threshold_time_s", float("inf")))
-    first = sorted_spikes[0]
+    cell: dict = {}
 
-    cell = {
-        "first_spike_threshold_mV": first.get("threshold_voltage_mV", float("nan")),
-        "first_spike_peak_mV": first.get("peak_voltage_mV", float("nan")),
-        "first_spike_height_mV": first.get("height_mV", float("nan")),
-    }
+    # Determine the working set for first-spike and adaptation metrics
+    if stimulus_epoch_index is not None:
+        epoch_spikes = [
+            r for r in spike_table
+            if r.get("epoch_at_threshold") == stimulus_epoch_index
+        ]
+    else:
+        epoch_spikes = spike_table
 
-    half_widths = [r["half_width_ms"] for r in spike_table
-                   if r.get("half_width_ms") is not None and
-                   not np.isnan(r["half_width_ms"])]
+    # First evoked AP: first spike at rheobase current
+    if epoch_spikes:
+        # Group by sweep to find rheobase (minimum current with ≥1 spike)
+        by_sweep: dict[tuple, list] = {}
+        for row in epoch_spikes:
+            key = (row.get("filename"), row.get("sweep_index"))
+            by_sweep.setdefault(key, []).append(row)
+
+        # Representative current for each sweep (use sweep_current_injection_pA
+        # if present, otherwise fall back to current_at_threshold_pA)
+        def _sweep_current(rows: list) -> float:
+            v = rows[0].get("sweep_current_injection_pA",
+                            rows[0].get("current_at_threshold_pA", float("nan")))
+            return float(v) if v is not None else float("nan")
+
+        rheobase_key = min(
+            by_sweep.keys(),
+            key=lambda k: _sweep_current(by_sweep[k]),
+        )
+        rheobase_spikes = sorted(
+            by_sweep[rheobase_key],
+            key=lambda r: r.get("threshold_time_s", float("inf")),
+        )
+        first = rheobase_spikes[0]
+
+        # Auto-collect all numeric fields from the first spike
+        for col, val in first.items():
+            if col in _SPIKE_IDENTITY_COLUMNS:
+                continue
+            try:
+                cell[f"first_spike_{col}"] = float(val) if val is not None else float("nan")
+            except (TypeError, ValueError):
+                pass  # skip non-numeric fields
+
+        # Explicit alias for clarity (already included above but kept for discoverability)
+        if "latency_to_epoch_onset_ms" in first:
+            cell["first_spike_latency_ms"] = cell.get(
+                "first_spike_latency_to_epoch_onset_ms", float("nan")
+            )
+
+    # Mean half-width across all spikes (not epoch-filtered — shape summary)
+    half_widths = [
+        r["half_width_ms"] for r in spike_table
+        if r.get("half_width_ms") is not None and not np.isnan(r["half_width_ms"])
+    ]
     if half_widths:
         cell["mean_half_width_ms"] = float(np.mean(half_widths))
 
-    # Adaptation index from the sweep with the most spikes
-    by_sweep: dict[tuple, list] = {}
-    for row in spike_table:
+    # Adaptation index from the sweep with the most spikes (within epoch if specified)
+    by_sweep_adapt: dict[tuple, list] = {}
+    for row in epoch_spikes:
         key = (row.get("filename"), row.get("sweep_index"))
-        by_sweep.setdefault(key, []).append(row)
+        by_sweep_adapt.setdefault(key, []).append(row)
 
-    most_spikes = max(by_sweep.values(), key=len, default=[])
+    most_spikes = max(by_sweep_adapt.values(), key=len, default=[])
     if len(most_spikes) >= 3:
-        # Sort by threshold time within sweep
         sweep_spikes = sorted(most_spikes, key=lambda r: r.get("threshold_time_s", 0.0))
         times = [r["threshold_time_s"] for r in sweep_spikes]
         isis = [times[i + 1] - times[i] for i in range(len(times) - 1)]

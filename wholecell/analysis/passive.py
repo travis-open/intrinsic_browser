@@ -144,17 +144,22 @@ def _analyze_one_sweep(
         row["input_resistance_MOhm"] = estimate_input_resistance(
             baseline_voltage, ep_voltage, step_current_pA
         )
+        row["input_resistance_peak_MOhm"] = estimate_peak_input_resistance(
+            baseline_voltage, ep_voltage, step_current_pA
+        )
 
     if "time_constant" in measures:
-        tau, fit_time, fit_voltage, fit_predicted = fit_time_constant(
+        tau, fit_time, fit_voltage, fit_predicted, r2 = fit_time_constant(
             ep_time, ep_voltage, baseline_voltage
         )
         row["time_constant_ms"] = tau
+        row["time_constant_r2"] = r2
         # Store fit arrays for GUI overlay — kept in result dict
         row["_tau_fit"] = {
             "time": fit_time.tolist() if fit_time is not None else None,
             "voltage": fit_voltage.tolist() if fit_voltage is not None else None,
             "predicted": fit_predicted.tolist() if fit_predicted is not None else None,
+            "r2": r2,
         }
 
     if any(m in measures for m in ("sag_ratio", "sag_amplitude", "sag_kinetics")):
@@ -179,9 +184,10 @@ def estimate_input_resistance(
     step_current_pA: float,
     steady_state_window_fraction: float = 0.1,
 ) -> float:
-    """Estimate input resistance (MΩ) from a single current step sweep.
+    """Estimate input resistance (MΩ) from steady-state voltage deflection.
 
-    Uses the steady-state voltage deflection at the end of the step.
+    Uses the mean voltage over the last ``steady_state_window_fraction`` of
+    the epoch as the steady-state estimate.
 
     Parameters
     ----------
@@ -192,21 +198,17 @@ def estimate_input_resistance(
     step_current_pA : float
         Injected current amplitude (pA). Sign is preserved.
     steady_state_window_fraction : float
-        Fraction of the epoch duration used to estimate the steady-state
-        voltage (taken from the end of the epoch). Default: last 20%.
+        Fraction of the epoch used for the SS estimate (from the end).
+        Default: last 10%.
 
     Returns
     -------
     float
-        Input resistance in MΩ. Returns NaN if current is zero or if
-        estimation fails.
+        Input resistance in MΩ. NaN if current is zero or estimation fails.
 
     Notes
     -----
-    R_in = ΔV / ΔI  (converted to MΩ: mV / pA = GΩ → × 1000 = MΩ)
-
-    TODO: implement steady-state estimation with spike exclusion for
-    depolarizing steps.
+    R_in = ΔV / ΔI  (mV / pA = GΩ → × 1000 = MΩ)
     """
     if step_current_pA == 0 or np.isnan(step_current_pA):
         return float("nan")
@@ -216,10 +218,41 @@ def estimate_input_resistance(
     steady_state_mV = float(np.mean(epoch_voltage[ss_start:]))
 
     delta_v_mV = steady_state_mV - baseline_voltage_mV
-    delta_i_pA = step_current_pA
+    rin_MOhm = (delta_v_mV / step_current_pA) * 1000.0
+    return float(rin_MOhm)
 
-    # ΔV(mV) / ΔI(pA) = GΩ; × 1000 = MΩ
-    rin_MOhm = (delta_v_mV / delta_i_pA) * 1000.0
+
+def estimate_peak_input_resistance(
+    baseline_voltage_mV: float,
+    epoch_voltage: np.ndarray,
+    step_current_pA: float,
+) -> float:
+    """Estimate input resistance (MΩ) from the peak (most hyperpolarized) voltage.
+
+    For hyperpolarizing steps this gives a larger Rin estimate than the
+    steady-state method because it captures the full transient deflection
+    before sag has reduced the response.
+
+    Parameters
+    ----------
+    baseline_voltage_mV : float
+        Mean voltage immediately before the step onset (mV).
+    epoch_voltage : np.ndarray
+        Voltage trace during the current step epoch (mV).
+    step_current_pA : float
+        Injected current amplitude (pA).
+
+    Returns
+    -------
+    float
+        Input resistance in MΩ. NaN if current is zero or estimation fails.
+    """
+    if step_current_pA == 0 or np.isnan(step_current_pA):
+        return float("nan")
+
+    v_peak = float(np.min(epoch_voltage))
+    delta_v_mV = v_peak - baseline_voltage_mV
+    rin_MOhm = (delta_v_mV / step_current_pA) * 1000.0
     return float(rin_MOhm)
 
 
@@ -228,7 +261,7 @@ def fit_time_constant(
     epoch_voltage: np.ndarray,
     baseline_voltage_mV: float,
     frac: float = 0.1,
-) -> tuple[float, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+) -> tuple[float, np.ndarray | None, np.ndarray | None, np.ndarray | None, float]:
     """Fit a single-exponential decay to the onset of a voltage step.
 
     The fit window runs from where the voltage has deflected ``frac`` of the
@@ -257,6 +290,8 @@ def fit_time_constant(
         Observed voltage in the fit window.
     fit_predicted : np.ndarray or None
         Model-predicted voltage in the fit window.
+    r2 : float
+        Coefficient of determination for the exponential fit. NaN if fit fails.
 
     Notes
     -----
@@ -267,7 +302,7 @@ def fit_time_constant(
 
     n = len(epoch_time)
     if n < 10:
-        return float("nan"), None, None, None
+        return float("nan"), None, None, None, float("nan")
 
     # Determine step direction and find peak deflection index
     mean_step_v = float(np.mean(epoch_voltage))
@@ -285,13 +320,13 @@ def fit_time_constant(
         search = np.flatnonzero(epoch_voltage >= threshold)
 
     if not search.size or search[0] >= peak_idx:
-        return float("nan"), None, None, None
+        return float("nan"), None, None, None, float("nan")
 
     fit_start_idx = int(search[0])
     fit_end_idx = peak_idx
 
     if fit_end_idx - fit_start_idx < 5:
-        return float("nan"), None, None, None
+        return float("nan"), None, None, None, float("nan")
 
     t_win = epoch_time[fit_start_idx:fit_end_idx + 1].copy()
     v_win = epoch_voltage[fit_start_idx:fit_end_idx + 1].copy()
@@ -325,10 +360,15 @@ def fit_time_constant(
         tau_s = float(popt[2])
         tau_ms = tau_s * 1000.0
         fit_predicted = _exp_model(t_win, *popt)
+
+        ss_res = float(np.sum((v_win - fit_predicted) ** 2))
+        ss_tot = float(np.sum((v_win - np.mean(v_win)) ** 2))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+
         # Return time in original (non-re-zeroed) coordinates for GUI
-        return tau_ms, t_win + t0, v_win, fit_predicted
+        return tau_ms, t_win + t0, v_win, fit_predicted, r2
     except Exception:
-        return float("nan"), None, None, None
+        return float("nan"), None, None, None, float("nan")
 
 
 def estimate_sag(
@@ -469,6 +509,13 @@ def _compute_cell_level(per_sweep: list[dict], measures: list[str]) -> dict:
             cell["std_input_resistance_MOhm"] = float(np.std(rins))
             cell["n_sweeps_rin"] = len(rins)
 
+        rins_peak = [r.get("input_resistance_peak_MOhm") for r in per_sweep
+                     if r.get("input_resistance_peak_MOhm") is not None and
+                     not np.isnan(r["input_resistance_peak_MOhm"])]
+        if rins_peak:
+            cell["mean_input_resistance_peak_MOhm"] = float(np.mean(rins_peak))
+            cell["std_input_resistance_peak_MOhm"] = float(np.std(rins_peak))
+
     if "time_constant" in measures:
         taus = [r.get("time_constant_ms") for r in per_sweep
                 if r.get("time_constant_ms") is not None and
@@ -477,6 +524,12 @@ def _compute_cell_level(per_sweep: list[dict], measures: list[str]) -> dict:
             cell["mean_time_constant_ms"] = float(np.mean(taus))
             cell["std_time_constant_ms"] = float(np.std(taus))
             cell["n_sweeps_tau"] = len(taus)
+
+        r2s = [r.get("time_constant_r2") for r in per_sweep
+               if r.get("time_constant_r2") is not None and
+               not np.isnan(r["time_constant_r2"])]
+        if r2s:
+            cell["mean_time_constant_r2"] = float(np.mean(r2s))
 
     if "sag_ratio" in measures:
         sags = [r.get("sag_ratio") for r in per_sweep

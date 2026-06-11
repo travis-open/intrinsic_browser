@@ -383,23 +383,28 @@ class Cell:
         lowpass_hz: float | None = None,
         **spike_finder_kwargs: Any,
     ) -> dict:
-        """Detect action potentials in the specified epoch of all sweeps.
+        """Detect action potentials in all sweeps of the named collection.
+
+        All spikes found anywhere in each sweep are returned. Each spike is
+        annotated with ``epoch_at_threshold`` (which epoch it falls in) and
+        ``latency_to_epoch_onset_ms``. ``epoch_index`` is used only to
+        measure ``current_injection_pA`` per sweep — not to filter spikes.
+        Downstream callers such as ``analyze_fi_curve`` and
+        ``extract_spike_features`` can filter to a specific epoch.
 
         Parameters
         ----------
         collection_name : str
         epoch_index : int
-            Zero-based epoch index for the current injection window.
-            Only spikes occurring within this epoch are counted.
-            Fails loudly if epoch cannot be parsed.
+            Zero-based reference epoch index. Used to determine injected
+            current amplitude per sweep. Fails loudly if it cannot be parsed.
         backend : str
             Spike finder backend: ``"derivative"`` (built-in, default) or
             ``"ipfx"`` (requires ipfx to be installed).
         lowpass_hz : float or None
             Low-pass filter cutoff for spike detection only.
         **spike_finder_kwargs
-            Passed to the spike finder backend (e.g. ``dvdt_threshold=20.0``
-            for the derivative finder).
+            Passed to the spike finder backend.
 
         Returns
         -------
@@ -413,11 +418,6 @@ class Cell:
             If epoch parsing fails.
         ImportError
             If backend is ``"ipfx"`` and ipfx is not installed.
-
-        Notes
-        -----
-        Implementation in ``wholecell.analysis.spikes.derivative`` and
-        ``wholecell.analysis.spikes.ipfx_backend``.
         """
         from wholecell.analysis.spikes.finder import run_spike_detection
         sc = self.get_collection(collection_name)
@@ -445,29 +445,24 @@ class Cell:
         """Build an F-I curve from previously detected spikes.
 
         Requires ``find_spikes`` to have been run on the same collection.
+        Only spikes in ``epoch_index`` are counted (filtered by
+        ``epoch_at_threshold``).
 
         Parameters
         ----------
         collection_name : str
         epoch_index : int
-            Used to determine current injection amplitude per sweep from
-            the epoch table. Fails loudly if epoch cannot be parsed.
+            Stimulus epoch to analyse. Spikes outside this epoch are ignored.
+            Also used to retrieve epoch duration for rate calculation.
         spike_result_timestamp : str or None
-            If None, uses the most recent spike detection result for this
-            collection. Pass a timestamp string to reference a specific
-            prior result.
+            If None, uses the most recent spike detection result.
 
         Returns
         -------
         dict
-            Timestamped result dict containing: per-sweep spike counts,
-            current amplitudes, mean firing rates, the full F-I curve as
-            parallel lists, rheobase estimate, and F-I slope(s).
+            Timestamped result dict with per-sweep metrics, F-I curve lists,
+            rheobase, slope (Hz/pA), R², peak instantaneous rates, and ISIs.
             Also appended to ``self.results["fi_curve"]``.
-
-        Notes
-        -----
-        Implementation in ``wholecell.analysis.fi_curve``.
         """
         from wholecell.analysis.fi_curve import run_fi_analysis
         sc = self.get_collection(collection_name)
@@ -480,11 +475,43 @@ class Cell:
         result = run_fi_analysis(sc, epoch_index, spikes)
         return self._store_result("fi_curve", result, params)
 
+    def plot_fi_curve(
+        self,
+        collection_name: str | None = None,
+        fi_result_timestamp: str | None = None,
+        block: bool = False,
+    ) -> None:
+        """Open the F-I curve viewer popup.
+
+        Parameters
+        ----------
+        collection_name : str or None
+            Ignored (kept for API symmetry). Uses the most recent fi_curve
+            result regardless of which collection it came from.
+        fi_result_timestamp : str or None
+            Reference a specific prior fi_curve result, or None for the
+            most recent.
+        block : bool
+            If True, block until the window is closed. If False (default),
+            show non-blocking.
+        """
+        from wholecell.gui.fi_viewer import FICurveViewer
+        fi_entry = self._get_latest_result("fi_curve")
+        viewer = FICurveViewer(
+            fi_result=fi_entry["data"],
+            title=f"{self.cell_id} — F-I Curve",
+        )
+        if block:
+            viewer.exec()
+        else:
+            viewer.show()
+
     def extract_spike_features(
         self,
         collection_name: str,
         spike_result_timestamp: str | None = None,
         lowpass_hz: float | None = None,
+        stimulus_epoch_index: int | None = None,
     ) -> dict:
         """Extract per-spike features (threshold, peak, trough, width, AHP).
 
@@ -496,26 +523,20 @@ class Cell:
             use the most recent.
         lowpass_hz : float or None
             Low-pass filter applied to voltage before feature extraction.
+        stimulus_epoch_index : int or None
+            If provided, cell-level summary features (first-AP features,
+            rheobase, adaptation index) are computed only from spikes in
+            this epoch. Should match the epoch_index used in find_spikes /
+            analyze_fi_curve.
 
         Returns
         -------
         dict
-            Timestamped result dict. The ``"spike_table"`` key contains a
-            list of dicts (one per spike) with columns:
-
-            - ``filename`` (str) — stem of source ABF file
-            - ``sweep_index`` (int)
-            - ``spike_index_in_sweep`` (int)
-            - ``peak_time_s``, ``peak_voltage_mV``
-            - ``threshold_time_s``, ``threshold_voltage_mV``
-            - ``trough_time_s``, ``trough_voltage_mV``
-            - ``half_width_ms``
-            - ``ahp_depth_mV``
-            - ``display_label`` (str) — for GUI use only, not a key
-
-        Notes
-        -----
-        Implementation in ``wholecell.analysis.spikes.features``.
+            Timestamped result dict. The ``"spike_table"`` key contains all
+            detected spikes (no epoch filtering) with columns including all
+            detection fields, shape features, ``epoch_at_threshold``, and
+            ``latency_to_epoch_onset_ms``. The ``"cell_level"`` key has
+            first-spike features auto-collected from the rheobase AP.
         """
         from wholecell.analysis.spikes.features import run_feature_extraction
         sc = self.get_collection(collection_name)
@@ -524,8 +545,13 @@ class Cell:
             "collection_name": collection_name,
             "spike_result_timestamp": spike_result_timestamp,
             "lowpass_hz": lowpass_hz,
+            "stimulus_epoch_index": stimulus_epoch_index,
         }
-        result = run_feature_extraction(sc, spikes, lowpass_hz=lowpass_hz)
+        result = run_feature_extraction(
+            sc, spikes,
+            lowpass_hz=lowpass_hz,
+            stimulus_epoch_index=stimulus_epoch_index,
+        )
         return self._store_result("spike_features", result, params)
 
     # ------------------------------------------------------------------

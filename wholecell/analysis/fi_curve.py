@@ -3,24 +3,23 @@ fi_curve.py
 -----------
 Frequency-current (F-I) curve construction and fitting.
 
-This module takes spike detection results (from finder.py) and per-sweep
-epoch information to build the F-I curve: injected current amplitude vs.
-mean firing rate (and/or spike count) per sweep.
+Takes spike detection results (from finder.py) and constructs the F-I curve:
+injected current amplitude vs. mean firing rate and peak instantaneous rate
+per sweep, restricted to spikes within the specified stimulus epoch.
 
 Outputs
 ~~~~~~~
-- Per-sweep: current_injection_pA, n_spikes, mean_firing_rate_hz,
-  instantaneous_rates (list), first_isi_ms, last_isi_ms
-- Cell-level: rheobase_pA, fi_slope_hz_per_pA (linear fit above rheobase),
-  max_firing_rate_hz, the full F-I curve as parallel lists
-
-The full F-I curve is stored as lists (not a fixed-width table) to
-accommodate cells with different numbers of current steps.
+- Per-sweep: current_injection_pA, epoch_duration_s, n_spikes,
+  mean_firing_rate_hz, peak_instantaneous_rate_hz, mean_isi_ms, min_isi_ms,
+  instantaneous_rates_hz (list), first_isi_ms, last_isi_ms
+- Cell-level: rheobase_pA, fi_slope_hz_per_pA, fi_slope_r2,
+  fi_slope_n_points, max_firing_rate_hz, max_peak_instantaneous_rate_hz,
+  n_steps_analyzed
+- fi_curve: parallel lists for plotting (current_pA, mean_rate_hz,
+  peak_rate_hz, n_spikes)
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import numpy as np
 
@@ -38,32 +37,24 @@ def run_fi_analysis(
 ) -> dict:
     """Build F-I curve from spike detection results.
 
+    Only spikes with ``epoch_at_threshold == epoch_index`` are counted.
+    This correctly handles the new all-spikes detection output where spikes
+    outside the stimulus epoch are annotated but not filtered.
+
     Parameters
     ----------
     collection : SweepCollection
     epoch_index : int
-        Used to retrieve epoch duration and current step amplitudes.
-        Fails loudly if epoch cannot be parsed.
+        The stimulus epoch to analyse. Spikes in other epochs are ignored.
     spike_result : dict
         Output of ``run_spike_detection`` (the ``"data"`` field from Cell).
-        Must have been run on the same collection.
 
     Returns
     -------
     dict with keys:
-        - ``"per_sweep"`` (list of dict): one entry per sweep with:
-            ``filename``, ``sweep_index``, ``display_label``,
-            ``current_injection_pA``, ``epoch_duration_s``, ``n_spikes``,
-            ``mean_firing_rate_hz``, ``instantaneous_rates_hz`` (list),
-            ``first_isi_ms``, ``last_isi_ms``
-
-        - ``"fi_curve"`` (dict): parallel lists for plotting:
-            ``current_pA`` (list), ``mean_rate_hz`` (list),
-            ``n_spikes`` (list)
-
-        - ``"cell_level"`` (dict):
-            ``rheobase_pA``, ``fi_slope_hz_per_pA``, ``max_firing_rate_hz``,
-            ``n_steps_analyzed``
+        - ``"per_sweep"`` (list of dict): one entry per sweep
+        - ``"fi_curve"`` (dict): parallel lists for plotting
+        - ``"cell_level"`` (dict): scalar summaries
 
     Raises
     ------
@@ -76,12 +67,12 @@ def run_fi_analysis(
         row = _build_sweep_row(collection, sweep_data, epoch_index)
         per_sweep.append(row)
 
-    # Sort by current amplitude for clean F-I curve
     per_sweep.sort(key=lambda r: r["current_injection_pA"])
 
     fi_curve = {
         "current_pA": [r["current_injection_pA"] for r in per_sweep],
         "mean_rate_hz": [r["mean_firing_rate_hz"] for r in per_sweep],
+        "peak_rate_hz": [r["peak_instantaneous_rate_hz"] for r in per_sweep],
         "n_spikes": [r["n_spikes"] for r in per_sweep],
     }
 
@@ -105,16 +96,7 @@ def _build_sweep_row(
 ) -> dict:
     """Build a per-sweep F-I row from spike detection data.
 
-    Parameters
-    ----------
-    collection : SweepCollection
-    sweep_data : dict
-        One element of spike_result["data"]["per_sweep"].
-    epoch_index : int
-
-    Returns
-    -------
-    dict
+    Filters to spikes in the specified stimulus epoch only.
     """
     from wholecell.core.sweep_collection import SweepRef
 
@@ -124,17 +106,26 @@ def _build_sweep_row(
         display_label=sweep_data["display_label"],
     )
 
-    # Epoch duration from the recording
     rec = collection._recordings[ref.filename]
     epoch = rec.get_epoch(ref.sweep_index, epoch_index)
     epoch_duration_s = epoch.end_time_s - epoch.start_time_s
 
-    spike_times = [sp["threshold_time_s"] for sp in sweep_data["spikes"]]
+    # Filter to spikes in the stimulus epoch only
+    epoch_spikes = [
+        sp for sp in sweep_data["spikes"]
+        if sp.get("epoch_at_threshold") == epoch_index
+    ]
+
+    spike_times = [sp["threshold_time_s"] for sp in epoch_spikes]
     n_spikes = len(spike_times)
 
     mean_rate_hz = (n_spikes / epoch_duration_s) if epoch_duration_s > 0 else 0.0
 
     isis_ms, inst_rates_hz = _compute_isis(spike_times)
+
+    mean_isi_ms = float(np.mean(isis_ms)) if isis_ms else float("nan")
+    min_isi_ms = float(np.min(isis_ms)) if isis_ms else float("nan")
+    peak_inst_rate_hz = (1000.0 / min_isi_ms) if not np.isnan(min_isi_ms) else float("nan")
 
     return {
         "filename": ref.filename,
@@ -144,6 +135,9 @@ def _build_sweep_row(
         "epoch_duration_s": epoch_duration_s,
         "n_spikes": n_spikes,
         "mean_firing_rate_hz": float(mean_rate_hz),
+        "peak_instantaneous_rate_hz": peak_inst_rate_hz,
+        "mean_isi_ms": mean_isi_ms,
+        "min_isi_ms": min_isi_ms,
         "instantaneous_rates_hz": inst_rates_hz,
         "first_isi_ms": float(isis_ms[0]) if isis_ms else float("nan"),
         "last_isi_ms": float(isis_ms[-1]) if isis_ms else float("nan"),
@@ -155,28 +149,14 @@ def _build_sweep_row(
 # ---------------------------------------------------------------------------
 
 def _compute_cell_level_fi(per_sweep: list[dict]) -> dict:
-    """Estimate rheobase, F-I slope, and max firing rate.
+    """Estimate rheobase, F-I slope, and max firing rates.
 
-    Parameters
-    ----------
-    per_sweep : list of dict
-        Sorted by current_injection_pA.
+    F-I slope fitting: linear regression over the ascending linear portion,
+    defined as sweeps from rheobase up to (and including) the first sweep
+    where mean_firing_rate_hz >= 80% of the maximum rate. This avoids
+    plateau/saturation at high current steps which would bias the slope down.
 
-    Returns
-    -------
-    dict with keys: rheobase_pA, fi_slope_hz_per_pA, max_firing_rate_hz,
-    n_steps_analyzed.
-
-    Notes
-    -----
-    Rheobase: smallest current injection at which at least one spike occurred.
-
-    F-I slope: linear regression of mean_rate_hz vs current_injection_pA
-    for sweeps above rheobase. Stored as Hz/pA.
-
-    TODO: implement linear regression; handle non-monotonic F-I curves
-    (common in some cell types). Consider offering both full-range and
-    linear-range slope estimates.
+    Returns NaN for slope/R² when fewer than 2 points are available.
     """
     n = len(per_sweep)
 
@@ -186,14 +166,46 @@ def _compute_cell_level_fi(per_sweep: list[dict]) -> dict:
             rheobase_pA = float(row["current_injection_pA"])
             break
 
-    max_rate = max((r["mean_firing_rate_hz"] for r in per_sweep), default=float("nan"))
+    supra = [r for r in per_sweep if r["n_spikes"] > 0]
+    max_rate = max((r["mean_firing_rate_hz"] for r in supra), default=float("nan"))
+    max_peak_inst = max(
+        (r["peak_instantaneous_rate_hz"] for r in supra
+         if not np.isnan(r["peak_instantaneous_rate_hz"])),
+        default=float("nan"),
+    )
 
-    # TODO: linear regression for F-I slope above rheobase
+    fi_slope_hz_per_pA = float("nan")
+    fi_slope_r2 = float("nan")
+    fi_slope_n_points = 0
+
+    if len(supra) >= 2 and not np.isnan(max_rate) and max_rate > 0:
+        rate_threshold = 0.8 * max_rate
+        fit_rows = []
+        for row in supra:
+            fit_rows.append(row)
+            if row["mean_firing_rate_hz"] >= rate_threshold:
+                break
+
+        if len(fit_rows) >= 2:
+            currents = np.array([r["current_injection_pA"] for r in fit_rows])
+            rates = np.array([r["mean_firing_rate_hz"] for r in fit_rows])
+            coeffs = np.polyfit(currents, rates, 1)
+            fi_slope_hz_per_pA = float(coeffs[0])
+            fi_slope_n_points = len(fit_rows)
+
+            # R² = 1 - SS_res / SS_tot
+            predicted = np.polyval(coeffs, currents)
+            ss_res = float(np.sum((rates - predicted) ** 2))
+            ss_tot = float(np.sum((rates - np.mean(rates)) ** 2))
+            fi_slope_r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
 
     return {
         "rheobase_pA": rheobase_pA,
-        "fi_slope_hz_per_pA": float("nan"),  # TODO
-        "max_firing_rate_hz": float(max_rate),
+        "max_firing_rate_hz": float(max_rate) if not np.isnan(max_rate) else float("nan"),
+        "max_peak_instantaneous_rate_hz": float(max_peak_inst),
+        "fi_slope_hz_per_pA": fi_slope_hz_per_pA,
+        "fi_slope_r2": fi_slope_r2,
+        "fi_slope_n_points": fi_slope_n_points,
         "n_steps_analyzed": n,
     }
 
@@ -207,17 +219,10 @@ def _compute_isis(
 ) -> tuple[list[float], list[float]]:
     """Compute inter-spike intervals and instantaneous firing rates.
 
-    Parameters
-    ----------
-    spike_times_s : list of float
-        Spike threshold times in seconds, ordered chronologically.
-
     Returns
     -------
     isis_ms : list of float
-        Inter-spike intervals in milliseconds.
     instantaneous_rates_hz : list of float
-        Instantaneous firing rate for each ISI (1 / ISI in seconds).
     """
     if len(spike_times_s) < 2:
         return [], []
