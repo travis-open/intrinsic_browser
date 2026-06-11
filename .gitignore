@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.abf
+*.nwb
+*.h5
+.ipynb_checkpoints/
+test_*.py
