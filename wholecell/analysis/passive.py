@@ -162,6 +162,9 @@ def _analyze_one_sweep(
             "r2": r2,
         }
 
+    # Always record minimum voltage — used to select the best sag reference sweep
+    row["min_voltage_mV"] = float(np.min(ep_voltage))
+
     if any(m in measures for m in ("sag_ratio", "sag_amplitude", "sag_kinetics")):
         sag = estimate_sag(ep_time, ep_voltage, baseline_voltage)
         if "sag_ratio" in measures:
@@ -531,22 +534,55 @@ def _compute_cell_level(per_sweep: list[dict], measures: list[str]) -> dict:
         if r2s:
             cell["mean_time_constant_r2"] = float(np.mean(r2s))
 
-    if "sag_ratio" in measures:
-        sags = [r.get("sag_ratio") for r in per_sweep
-                if r.get("sag_ratio") is not None and
-                not np.isnan(r["sag_ratio"])]
-        if sags:
-            cell["mean_sag_ratio"] = float(np.mean(sags))
-            cell["std_sag_ratio"] = float(np.std(sags))
-
-    if "sag_amplitude" in measures:
-        amps = [r.get("sag_amplitude_mV") for r in per_sweep
-                if r.get("sag_amplitude_mV") is not None and
-                not np.isnan(r["sag_amplitude_mV"])]
-        if amps:
-            cell["mean_sag_amplitude_mV"] = float(np.mean(amps))
+    sag_measures = [m for m in ("sag_ratio", "sag_amplitude", "sag_kinetics")
+                    if m in measures]
+    if sag_measures:
+        ref = _find_best_sag_sweep(per_sweep)
+        if ref is not None:
+            cell["sag_sweep_filename"] = ref.get("filename")
+            cell["sag_sweep_index"] = ref.get("sweep_index")
+            cell["sag_min_voltage_mV"] = ref.get("min_voltage_mV", float("nan"))
+            if "sag_ratio" in measures:
+                cell["sag_ratio"] = ref.get("sag_ratio", float("nan"))
+            if "sag_amplitude" in measures:
+                cell["sag_amplitude_mV"] = ref.get("sag_amplitude_mV", float("nan"))
+            if "sag_kinetics" in measures:
+                cell["sag_tau_ms"] = ref.get("sag_tau_ms", float("nan"))
 
     return cell
+
+
+def _find_best_sag_sweep(
+    per_sweep: list[dict],
+    target_mv: float = -100.0,
+) -> dict | None:
+    """Return the per-sweep row whose minimum voltage is closest to target_mv.
+
+    Used to select a consistent reference sweep for cell-level sag values.
+    The conventional target is -100 mV — a hyperpolarization large enough
+    to activate Ih reliably without exceeding the reversal potential.
+
+    Parameters
+    ----------
+    per_sweep : list of dict
+        Per-sweep result rows, each expected to have ``min_voltage_mV``.
+    target_mv : float
+        Target minimum voltage (mV). Default: -100.0.
+
+    Returns
+    -------
+    dict or None
+        The row closest to target_mv, or None if per_sweep is empty or all
+        ``min_voltage_mV`` values are NaN.
+    """
+    candidates = [
+        r for r in per_sweep
+        if r.get("min_voltage_mV") is not None
+        and not np.isnan(r["min_voltage_mV"])
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda r: abs(r["min_voltage_mV"] - target_mv))
 
 
 # ---------------------------------------------------------------------------
