@@ -92,13 +92,14 @@ class TraceViewer:
         self._filter_on = False
         self._show_current = False
         self._show_dvdt = False
-        self._show_spikes = spike_result is not None
+        self._show_spikes = False
 
-        # Spike / tau lookups
-        self._spike_lookup: dict[int, list] = {}
+        # spike_data: sweep_index → list of spike dicts (threshold/peak/trough times+voltages)
+        self._spike_data: dict[int, list] = {}
         if spike_result:
-            for sd in spike_result.get("data", {}).get("per_sweep", []):
-                self._spike_lookup[sd["sweep_index"]] = sd.get("spikes", [])
+            for sd in spike_result.get("per_sweep", []):
+                self._spike_data[sd["sweep_index"]] = sd.get("spikes", [])
+            self._show_spikes = True
 
         self._tau_lookup: dict[int, dict] = {}
         if passive_result:
@@ -148,6 +149,13 @@ class TraceViewer:
         btn_row.addWidget(btn_all)
         btn_row.addWidget(btn_none)
         left_layout.addLayout(btn_row)
+
+        btn_spikes = QtWidgets.QPushButton("Find Spikes  (S = toggle)")
+        btn_spikes.setStyleSheet(
+            "font-size: 11px; padding: 4px; background: #2a2a4a; color: #aaf;"
+        )
+        btn_spikes.clicked.connect(self._run_spike_detection)
+        left_layout.addWidget(btn_spikes)
 
         btn_avg = QtWidgets.QPushButton("Average && Analyze Subthreshold")
         btn_avg.setStyleSheet(
@@ -209,6 +217,22 @@ class TraceViewer:
         self._avg_curve_d = self._plot_d.plot(
             pen=self._make_pen("#0ff", width=2, alpha=200)
         )
+
+        # Global spike marker scatter plots (one set per feature, shared across sweeps)
+        _sp = dict(pen=None, symbolPen=None)
+        self._mk_threshold = self._plot_v.plot(
+            symbol="t1", symbolSize=11, symbolBrush="#f80", **_sp)   # ▼ orange
+        self._mk_peak = self._plot_v.plot(
+            symbol="o",  symbolSize=10, symbolBrush="#4f4", **_sp)   # ● green
+        self._mk_trough = self._plot_v.plot(
+            symbol="d",  symbolSize=10, symbolBrush="#f44", **_sp)   # ◆ red
+        self._mk_upstroke = self._plot_d.plot(
+            symbol="t",  symbolSize=11, symbolBrush="#0ff", **_sp)   # ▲ cyan
+        self._mk_downstroke = self._plot_d.plot(
+            symbol="t1", symbolSize=11, symbolBrush="#f4f", **_sp)   # ▼ magenta
+        for mk in (self._mk_threshold, self._mk_peak, self._mk_trough,
+                   self._mk_upstroke, self._mk_downstroke):
+            mk.setZValue(20)
 
         # Per-sweep curve sets
         self._curves: dict[int, dict] = {}
@@ -290,25 +314,18 @@ class TraceViewer:
             else:
                 c["d"].setData([], [])
 
-            self._update_spike_scatter(idx, c, color)
             self._update_tau(idx, c)
 
+        self._update_spike_markers()
         self._list.setCurrentRow(self._cursor)
         self._update_status()
 
     def _make_curves(self, idx: int) -> dict:
-        import pyqtgraph as pg
         from pyqtgraph.Qt import QtCore
         c: dict = {}
         c["v"] = self._plot_v.plot(name=f"s{idx:03d}")
         c["i"] = self._plot_i.plot()
         c["d"] = self._plot_d.plot()
-        c["thresh"] = self._plot_v.plot(pen=None, symbol="t",
-                                         symbolSize=9, symbolPen=None)
-        c["peak"]   = self._plot_v.plot(pen=None, symbol="o",
-                                         symbolSize=7, symbolPen=None)
-        c["trough"] = self._plot_v.plot(pen=None, symbol="d",
-                                         symbolSize=7, symbolPen=None)
         c["tau"] = self._plot_v.plot(
             pen=self._make_pen("#ff0", 2, 200,
                                style=QtCore.Qt.PenStyle.DashLine)
@@ -337,35 +354,108 @@ class TraceViewer:
             pen.setStyle(style)
         return pen
 
-    def _update_spike_scatter(self, idx, c, color) -> None:
-        if not self._show_spikes:
-            for k in ("thresh", "peak", "trough"):
-                c[k].setData([], [])
+    def _run_spike_detection(self) -> None:
+        """Detect spikes in all checked sweeps and update global markers."""
+        from wholecell.core.sweep_collection import SweepCollection, SweepRef
+        from wholecell.analysis.spikes.finder import run_spike_detection
+
+        checked = self._checked_sweeps()
+        if not checked:
+            self._results_box.setPlainText("No sweeps checked for spike detection.")
             return
-        spikes = self._spike_lookup.get(idx, [])
-        if not spikes:
-            for k in ("thresh", "peak", "trough"):
-                c[k].setData([], [])
+
+        rec = self._rec
+        sweeps = [SweepRef(rec.filename, i) for i in checked]
+        col = SweepCollection(
+            name="viewer_spikes",
+            sweeps=sweeps,
+            recordings={rec.filename: rec},
+        )
+        try:
+            result = run_spike_detection(col, epoch_index=self._step_epoch_index)
+        except Exception as exc:
+            self._results_box.setPlainText(f"Spike detection error:\n{exc}")
             return
-        sz = 8
-        c["thresh"].setData(
-            [s["threshold_time_s"] for s in spikes],
-            [s["threshold_voltage_mV"] for s in spikes],
+
+        for sd in result.get("per_sweep", []):
+            self._spike_data[sd["sweep_index"]] = sd.get("spikes", [])
+
+        n_spikes = sum(len(v) for v in self._spike_data.values())
+        self._results_box.setPlainText(
+            f"Detected {n_spikes} spike(s) across {len(checked)} sweep(s).\n"
+            "Press S to toggle markers."
         )
-        c["thresh"].setSymbolSize(sz)
-        c["thresh"].setSymbolBrush("#f70")
-        c["peak"].setData(
-            [s["peak_time_s"] for s in spikes],
-            [s["peak_voltage_mV"] for s in spikes],
-        )
-        c["peak"].setSymbolSize(sz - 2)
-        c["peak"].setSymbolBrush("#0f0")
-        c["trough"].setData(
-            [s["trough_time_s"] for s in spikes],
-            [s["trough_voltage_mV"] for s in spikes],
-        )
-        c["trough"].setSymbolSize(sz - 2)
-        c["trough"].setSymbolBrush("#f44")
+        self._show_spikes = True
+        self._update_spike_markers()
+
+    def _update_spike_markers(self) -> None:
+        """Aggregate spike feature coordinates from all checked sweeps and
+        update the five global scatter plots.  dV/dt markers are computed
+        from the voltage derivative within threshold→peak and peak→trough
+        windows respectively."""
+        visible = self._show_spikes and bool(self._spike_data)
+
+        if not visible:
+            for mk in (self._mk_threshold, self._mk_peak, self._mk_trough,
+                       self._mk_upstroke, self._mk_downstroke):
+                mk.setData([], [])
+            return
+
+        checked = set(self._checked_sweeps())
+        thresh_t, thresh_v = [], []
+        peak_t, peak_v = [], []
+        trough_t, trough_v = [], []
+        up_t, up_dvdt = [], []
+        dn_t, dn_dvdt = [], []
+
+        lowpass = self._default_lowpass_hz if self._filter_on else None
+
+        for idx in checked:
+            spikes = self._spike_data.get(idx)
+            if not spikes:
+                continue
+
+            # Voltage + time arrays for dV/dt computation
+            try:
+                t_arr, v_arr, _ = self._rec.get_sweep_arrays(idx, lowpass_hz=lowpass)
+                dt = t_arr[1] - t_arr[0]
+                dvdt = np.gradient(v_arr, t_arr) / 1000.0  # mV/ms
+            except Exception:
+                t_arr = v_arr = dvdt = None
+
+            for sp in spikes:
+                thresh_t.append(sp["threshold_time_s"])
+                thresh_v.append(sp["threshold_voltage_mV"])
+                peak_t.append(sp["peak_time_s"])
+                peak_v.append(sp["peak_voltage_mV"])
+                trough_t.append(sp["trough_time_s"])
+                trough_v.append(sp["trough_voltage_mV"])
+
+                if dvdt is not None:
+                    # Upstroke: max dV/dt between threshold and peak
+                    i0 = sp.get("threshold_index",
+                                np.searchsorted(t_arr, sp["threshold_time_s"]))
+                    i1 = sp.get("peak_index",
+                                np.searchsorted(t_arr, sp["peak_time_s"]))
+                    i2 = sp.get("trough_index",
+                                np.searchsorted(t_arr, sp["trough_time_s"]))
+                    i0 = max(0, min(i0, len(dvdt) - 1))
+                    i1 = max(i0 + 1, min(i1, len(dvdt) - 1))
+                    i2 = max(i1 + 1, min(i2, len(dvdt) - 1))
+
+                    up_idx = i0 + int(np.argmax(dvdt[i0:i1]))
+                    up_t.append(t_arr[up_idx])
+                    up_dvdt.append(dvdt[up_idx])
+
+                    dn_idx = i1 + int(np.argmin(dvdt[i1:i2]))
+                    dn_t.append(t_arr[dn_idx])
+                    dn_dvdt.append(dvdt[dn_idx])
+
+        self._mk_threshold.setData(thresh_t, thresh_v)
+        self._mk_peak.setData(peak_t, peak_v)
+        self._mk_trough.setData(trough_t, trough_v)
+        self._mk_upstroke.setData(up_t, up_dvdt)
+        self._mk_downstroke.setData(dn_t, dn_dvdt)
 
     def _update_tau(self, idx, c) -> None:
         fit = self._tau_lookup.get(idx)
@@ -401,7 +491,7 @@ class TraceViewer:
             return
 
         # ---- Warn if any checked sweep contains detected spikes ----
-        spiking = [i for i in checked if self._spike_lookup.get(i)]
+        spiking = [i for i in checked if self._spike_data.get(i)]
         if not spiking:
             # No spike result loaded — do a quick threshold scan
             spiking = self._detect_spiking_sweeps(checked)
