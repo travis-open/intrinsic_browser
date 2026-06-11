@@ -90,6 +90,7 @@ class TraceViewer:
         self._show_current = False
         self._show_dvdt = False
         self._show_spikes = False
+        self._solo_mode = False
 
         # Analysis state — keyed by (filename, sweep_index)
         self._spike_data: dict[tuple[str, int], list] = {}
@@ -152,6 +153,9 @@ class TraceViewer:
         self._file_tree.setStyleSheet(
             "QTreeWidget { background: #111; color: #ddd; font-size: 11px; }"
             "QTreeWidget::item:selected { background: #2a2a4a; }"
+            "QTreeWidget::indicator { width: 13px; height: 13px; }"
+            "QTreeWidget::indicator:unchecked { border: 1px solid #888; background: #2a2a2a; }"
+            "QTreeWidget::indicator:checked { border: 1px solid #aaa; background: #5588dd; }"
         )
         self._file_tree.setFixedHeight(160)
         self._file_tree.itemChanged.connect(self._on_tree_item_changed)
@@ -170,6 +174,8 @@ class TraceViewer:
         self._collections_combo.setStyleSheet(
             "QComboBox { background: #1a1a1a; color: #ddd; font-size: 11px; "
             "border: 1px solid #444; }"
+            "QComboBox QAbstractItemView { background: #1a1a1a; color: #ddd; "
+            "selection-background-color: #2a2a4a; border: 1px solid #555; }"
         )
         self._collections_combo.currentTextChanged.connect(self._on_collection_changed)
         coll_row.addWidget(coll_lbl)
@@ -185,6 +191,9 @@ class TraceViewer:
         self._list.setStyleSheet(
             "QListWidget { background: #1a1a1a; color: #ddd; font-size: 11px; }"
             "QListWidget::item:selected { background: #333; }"
+            "QListWidget::indicator { width: 13px; height: 13px; }"
+            "QListWidget::indicator:unchecked { border: 1px solid #888; background: #2a2a2a; }"
+            "QListWidget::indicator:checked { border: 1px solid #aaa; background: #5588dd; }"
         )
         self._list.itemChanged.connect(self._on_item_changed)
         left_layout.addWidget(self._list, stretch=1)
@@ -192,12 +201,15 @@ class TraceViewer:
         btn_row = QtWidgets.QHBoxLayout()
         btn_all = QtWidgets.QPushButton("All")
         btn_none = QtWidgets.QPushButton("None")
-        for btn in (btn_all, btn_none):
+        self._btn_solo = QtWidgets.QPushButton("Solo  (V)")
+        for btn in (btn_all, btn_none, self._btn_solo):
             btn.setStyleSheet("font-size: 11px; padding: 2px 6px;")
         btn_all.clicked.connect(self._check_all)
         btn_none.clicked.connect(self._check_none)
+        self._btn_solo.clicked.connect(self._toggle_solo)
         btn_row.addWidget(btn_all)
         btn_row.addWidget(btn_none)
+        btn_row.addWidget(self._btn_solo)
         left_layout.addLayout(btn_row)
 
         thresh_row = QtWidgets.QHBoxLayout()
@@ -230,6 +242,11 @@ class TraceViewer:
         )
         btn_avg.clicked.connect(self._run_average_analysis)
         left_layout.addWidget(btn_avg)
+
+        btn_clear = QtWidgets.QPushButton("Clear Plot")
+        btn_clear.setStyleSheet("font-size: 11px; padding: 3px;")
+        btn_clear.clicked.connect(self._clear_plot)
+        left_layout.addWidget(btn_clear)
 
         # Results display
         res_lbl = QtWidgets.QLabel("Results")
@@ -396,7 +413,7 @@ class TraceViewer:
                 file_item.addChild(sweep_item)
 
             self._file_tree.addTopLevelItem(file_item)
-            file_item.setExpanded(True)
+            file_item.setExpanded(False)
 
         self._file_tree.blockSignals(False)
 
@@ -504,8 +521,9 @@ class TraceViewer:
         # files may have different protocols with the step at a different index.
         self._auto_detect_epoch()
 
-        # Clear spike state so markers from a previous collection don't bleed
-        # into the new one.  The user must re-run Find Spikes per collection.
+        # Clear average trace and spike state so nothing from the previous
+        # collection bleeds into the new one.
+        self._clear_avg_curves()
         self._spike_data = {}
         self._update_spike_markers()
 
@@ -568,6 +586,17 @@ class TraceViewer:
     # Full refresh
     # ------------------------------------------------------------------
 
+    def _clear_avg_curves(self) -> None:
+        for curve in (self._avg_curve_v, self._avg_curve_i,
+                      self._avg_curve_d, self._avg_tau_curve):
+            curve.setData([], [])
+        self._avg_tau_fit = None
+
+    def _clear_plot(self) -> None:
+        self._check_none()
+        self._clear_avg_curves()
+        self._results_box.clear()
+
     def _clear_curves(self) -> None:
         for pos in list(self._curves.keys()):
             self._remove_curves(pos)
@@ -579,7 +608,9 @@ class TraceViewer:
 
         lowpass = self._default_lowpass_hz if self._filter_on else None
         n = self._current_collection.n_sweeps
-        to_show = set(self._checked_sweeps())
+        to_show = (
+            {self._cursor} if self._solo_mode else set(self._checked_sweeps())
+        )
 
         for pos in list(self._curves.keys()):
             if pos not in to_show:
@@ -587,8 +618,8 @@ class TraceViewer:
 
         for pos in to_show:
             ref = self._ref_at(pos)
-            color = _sweep_color(pos, n)
-            pen = self._make_pen(color, 1, 200)
+            color = "#fff" if self._solo_mode else _sweep_color(pos, n)
+            pen = self._make_pen(color, 2 if self._solo_mode else 1, 200)
 
             try:
                 t, v, _ = self._current_collection.get_sweep_arrays(
@@ -730,7 +761,9 @@ class TraceViewer:
         if self._current_collection is None:
             return
 
-        checked = set(self._checked_sweeps())
+        checked = (
+            {self._cursor} if self._solo_mode else set(self._checked_sweeps())
+        )
         thresh_t, thresh_v = [], []
         peak_t, peak_v = [], []
         trough_t, trough_v = [], []
@@ -1255,6 +1288,14 @@ class TraceViewer:
     def _on_item_changed(self, item) -> None:
         self._full_update()
 
+    def _toggle_solo(self) -> None:
+        self._solo_mode = not self._solo_mode
+        self._btn_solo.setStyleSheet(
+            "font-size: 11px; padding: 2px 6px;"
+            + ("background: #4a3a1a; color: #fc8;" if self._solo_mode else "")
+        )
+        self._full_update()
+
     def _check_all(self) -> None:
         from pyqtgraph.Qt import QtCore
         self._list.blockSignals(True)
@@ -1329,6 +1370,8 @@ class TraceViewer:
         elif key == QtCore.Qt.Key.Key_S:
             self._show_spikes = not self._show_spikes
             self._full_update()
+        elif key == QtCore.Qt.Key.Key_V:
+            self._toggle_solo()
         elif key in (QtCore.Qt.Key.Key_Q, QtCore.Qt.Key.Key_Escape):
             self._win.close()
 
