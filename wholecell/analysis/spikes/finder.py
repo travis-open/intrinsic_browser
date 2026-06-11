@@ -141,11 +141,13 @@ def _detect_in_sweep(
         for i, sp in enumerate(epoch_spikes)
     ]
 
-    # Current injection at each spike's threshold sample
+    # Current injection at each spike's threshold sample.
+    # Falls back to the epoch command level when the recorded current channel
+    # is absent (single-channel ABF files return all-NaN for current).
     for sd, sp in zip(spike_dicts, epoch_spikes):
         idx = min(sp.threshold_index, len(current) - 1)
         val = float(current[idx])
-        sd["current_at_threshold_pA"] = val if not np.isnan(val) else float("nan")
+        sd["current_at_threshold_pA"] = val if not np.isnan(val) else float(epoch.level)
 
     # Slow AHP: minimum voltage between each spike and the next spike's
     # threshold (or the epoch end for the last spike).

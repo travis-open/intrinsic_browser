@@ -504,6 +504,11 @@ class TraceViewer:
         # files may have different protocols with the step at a different index.
         self._auto_detect_epoch()
 
+        # Clear spike state so markers from a previous collection don't bleed
+        # into the new one.  The user must re-run Find Spikes per collection.
+        self._spike_data = {}
+        self._update_spike_markers()
+
         self._cursor = 0
         self._populate_sweep_list()
         self._clear_curves()
@@ -1153,7 +1158,14 @@ class TraceViewer:
         )
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = self._cell.output_dir / f"{self._cell.cell_id}_spikes_{ts}.csv"
+        suggested = str(
+            self._cell.output_dir / f"{self._cell.cell_id}_spikes_{ts}.csv"
+        )
+        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self._win, "Save Spike Table", suggested, "CSV files (*.csv)"
+        )
+        if not filepath:
+            return
         try:
             df.to_csv(filepath, index=False)
             self._results_box.setPlainText(f"Spike table saved:\n{filepath}")
@@ -1161,6 +1173,7 @@ class TraceViewer:
             self._results_box.setPlainText(f"Export failed:\n{exc}")
 
     def _on_export_sweep_summary(self) -> None:
+        from datetime import datetime
         from pyqtgraph.Qt import QtWidgets
 
         coll_name = self._collections_combo.currentText()
@@ -1178,16 +1191,34 @@ class TraceViewer:
             )
             return
 
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suggested = str(
+            self._cell.output_dir / f"{self._cell.cell_id}_sweep_summary_{ts}.csv"
+        )
+        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self._win, "Save Sweep Summary", suggested, "CSV files (*.csv)"
+        )
+        if not filepath:
+            return
         try:
-            path = self._cell.export_sweep_summary(coll_name, epoch_idx)
+            path = self._cell.export_sweep_summary(coll_name, epoch_idx,
+                                                    filepath=filepath)
             self._results_box.setPlainText(f"Sweep summary saved:\n{path}")
         except Exception as exc:
             self._results_box.setPlainText(f"Export failed:\n{exc}")
 
     def _on_export_cell_summary(self) -> None:
+        from pyqtgraph.Qt import QtWidgets
+
+        suggested = str(self._cell.output_dir / f"{self._cell.cell_id}_cell_summary.json")
+        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self._win, "Save Cell Summary", suggested, "JSON files (*.json)"
+        )
+        if not filepath:
+            return
         try:
-            path = self._cell.export_cell_summary()
-            self._results_box.setPlainText(f"Cell summary saved:\n{path}")
+            self._cell.export_cell_summary(filepath=filepath)
+            self._results_box.setPlainText(f"Cell summary saved:\n{filepath}")
         except Exception as exc:
             self._results_box.setPlainText(f"Export failed:\n{exc}")
 
