@@ -1621,15 +1621,20 @@ class TraceViewer:
         # Reset all transient GUI state
         self._current_collection = None
         self._cursor = 0
+        # _clear_curves() must come before clearing the dict — it iterates
+        # self._curves to remove items from the pyqtgraph plots, then deletes
+        # the keys. Clearing the dict first would orphan plot items on screen.
+        self._clear_curves()
+        self._clear_avg_curves()
         self._spike_data.clear()
         self._tau_lookup.clear()
         self._avg_tau_fit = None
-        self._curves.clear()
-        self._clear_avg_curves()
-        self._clear_curves()
+        self._update_spike_markers()   # clears marker scatter plots
+        self._list.clear()
         self._results_box.clear()
         self._cell_id_edit.setText(self._cell.cell_id)
         self._win.setWindowTitle(f"Trace Viewer — {self._cell.cell_id}")
+        self._refresh_analysis_checks()
 
         # Restore the preserved settings
         self._dvdt_spin.setValue(saved_dvdt)
