@@ -376,6 +376,8 @@ class TraceViewer:
 
         # File menu
         file_menu = mb.addMenu("File")
+        act_session = file_menu.addAction("Open Session…")
+        act_session.triggered.connect(self._on_open_session)
         act_open = file_menu.addAction("Open Directory…")
         act_open.triggered.connect(self._on_open_directory)
         file_menu.addSeparator()
@@ -1051,7 +1053,7 @@ class TraceViewer:
             "lowpass_hz": self._default_lowpass_hz if self._filter_on else None,
             "n_sweeps_averaged": len(checked),
         }
-        self._cell._store_result("passive", result_data, params)
+        self._cell._store_result("passive_repeated_step", result_data, params)
 
         # Display results
         filt_str = f"LP {self._default_lowpass_hz:.0f} Hz" if self._filter_on else "raw"
@@ -1134,7 +1136,7 @@ class TraceViewer:
             "n_sweeps": len(checked),
             "source": "per_sweep_passive",
         }
-        self._cell._store_result("passive", result, params)
+        self._cell._store_result("passive_range", result, params)
 
         # Build per-sweep display table
         per_sweep = result.get("per_sweep", [])
@@ -1280,6 +1282,44 @@ class TraceViewer:
     # ------------------------------------------------------------------
     # Export actions
     # ------------------------------------------------------------------
+
+    def _on_open_session(self) -> None:
+        from pyqtgraph.Qt import QtWidgets
+        from wholecell.core.cell import Cell
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._win, "Open Session", str(self._cell.output_dir),
+            "Session files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            cell = Cell.load_session(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self._win, "Load failed", str(exc))
+            return
+
+        self._cell = cell
+        self._current_collection = None
+        self._cursor = 0
+        self._spike_data.clear()
+        self._curves.clear()
+
+        self._cell_id_edit.setText(cell.cell_id)
+        self._win.setWindowTitle(f"Trace Viewer — {cell.cell_id}")
+
+        self._build_file_tree()
+        self._update_collections_combo()
+
+        if cell.collections:
+            first = next(iter(cell.collections))
+            idx = self._collections_combo.findText(first)
+            if idx >= 0:
+                self._collections_combo.setCurrentIndex(idx)
+            self._on_collection_changed(first)
+
+        self._results_box.setPlainText(f"Session loaded:\n{path}")
 
     def _on_open_directory(self) -> None:
         from pyqtgraph.Qt import QtWidgets
@@ -1655,7 +1695,11 @@ def main() -> None:
         launch_viewer(lowpass_hz=args.lowpass, epoch_index=args.epoch)
     else:
         p = Path(args.path)
-        if p.is_dir():
+        if p.suffix.lower() == ".json":
+            from wholecell.core.cell import Cell
+            cell = Cell.load_session(p)
+            launch_from_cell(cell, lowpass_hz=args.lowpass, epoch_index=args.epoch)
+        elif p.is_dir():
             launch_viewer(directory=p, cell_id=args.cell_id,
                           lowpass_hz=args.lowpass, epoch_index=args.epoch)
         else:

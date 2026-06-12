@@ -351,7 +351,7 @@ class Cell:
         -------
         dict
             Timestamped result dict. Also appended to
-            ``self.results["passive"]``.
+            ``self.results["passive_range"]``.
 
         Raises
         ------
@@ -373,7 +373,7 @@ class Cell:
             "lowpass_hz": lowpass_hz,
         }
         result = run_passive_analysis(sc, epoch_index, measures=measures, lowpass_hz=lowpass_hz)
-        return self._store_result("passive", result, params)
+        return self._store_result("passive_range", result, params)
 
     def find_spikes(
         self,
@@ -717,15 +717,15 @@ class Cell:
             "exported_at": _timestamp(),
         }
 
-        # Passive section
-        if self.results.get("passive"):
-            data = self.results["passive"][-1]["data"]
-            if data.get("type") == "averaged_passive":
-                summary["passive"] = {k: v for k, v in data.items()
-                                       if k not in ("type", "_tau_fit")}
-            else:
-                summary["passive"] = data.get("cell_level", {})
-                summary["passive"]["source"] = "per_sweep_average"
+        # Passive section — two independent workflows
+        if self.results.get("passive_repeated_step"):
+            data = self.results["passive_repeated_step"][-1]["data"]
+            summary["passive_repeated_step"] = {
+                k: v for k, v in data.items() if k not in ("type", "_tau_fit")
+            }
+        if self.results.get("passive_range"):
+            data = self.results["passive_range"][-1]["data"]
+            summary["passive_range"] = data.get("cell_level", {})
 
         # Spike features section
         if self.results.get("spike_features"):
