@@ -82,6 +82,7 @@ class FICurveViewer:
         self._plot_widget.setBackground("#111")
         self._plot_widget.setLabel("bottom", "Current injection (pA)")
         self._plot_widget.setLabel("left", "Firing rate (Hz)")
+        self._plot_widget.getAxis("left").enableAutoSIPrefix(False)
         self._plot_widget.showGrid(x=True, y=True, alpha=0.2)
         layout.addWidget(self._plot_widget)
 

@@ -749,6 +749,14 @@ class Cell:
         if self.results.get("fi_curve"):
             summary["fi_curve"] = self.results["fi_curve"][-1]["data"]
 
+        # Ramp-evoked AP section
+        if self.results.get("ramp_evoked_APs"):
+            summary["ramp_evoked_APs"] = self.results["ramp_evoked_APs"][-1]["data"]
+
+        # Resting potential section
+        if self.results.get("v_rest"):
+            summary["v_rest"] = self.results["v_rest"][-1]["data"]["cell_level"]
+
         if filepath is None:
             filepath = self.output_dir / f"{self.cell_id}_cell_summary.json"
         filepath = Path(filepath)
