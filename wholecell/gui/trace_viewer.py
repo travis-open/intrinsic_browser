@@ -643,7 +643,7 @@ class TraceViewer:
             | QtCore.Qt.ItemFlag.ItemIsUserCheckable
             | QtCore.Qt.ItemFlag.ItemIsEnabled
         )
-        item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        item.setCheckState(QtCore.Qt.CheckState.Checked)
         return item
 
     def _ref_at(self, pos: int):
