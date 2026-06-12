@@ -229,6 +229,23 @@ class TraceViewer:
         thresh_row.addWidget(self._dvdt_spin, stretch=1)
         left_layout.addLayout(thresh_row)
 
+        peak_row = QtWidgets.QHBoxLayout()
+        peak_lbl = QtWidgets.QLabel("Peak window:")
+        peak_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._peak_window_spin = QtWidgets.QDoubleSpinBox()
+        self._peak_window_spin.setRange(5.0, 100.0)
+        self._peak_window_spin.setSingleStep(1.0)
+        self._peak_window_spin.setDecimals(1)
+        self._peak_window_spin.setValue(20.0)
+        self._peak_window_spin.setSuffix(" ms")
+        self._peak_window_spin.setStyleSheet(
+            "QDoubleSpinBox { background: #1a1a1a; color: #ddd; font-size: 11px; "
+            "border: 1px solid #444; padding: 2px; }"
+        )
+        peak_row.addWidget(peak_lbl)
+        peak_row.addWidget(self._peak_window_spin, stretch=1)
+        left_layout.addLayout(peak_row)
+
         btn_spikes = QtWidgets.QPushButton("Find Spikes  (S = toggle)")
         btn_spikes.setStyleSheet(
             "font-size: 11px; padding: 4px; background: #2a2a4a; color: #aaf;"
@@ -236,26 +253,67 @@ class TraceViewer:
         btn_spikes.clicked.connect(self._run_spike_detection)
         left_layout.addWidget(btn_spikes)
 
+        def _make_status_checkbox(tooltip: str) -> QtWidgets.QCheckBox:
+            cb = QtWidgets.QCheckBox()
+            cb.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            cb.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            cb.setToolTip(tooltip)
+            return cb
+
         btn_fi = QtWidgets.QPushButton("F-I Curve")
         btn_fi.setStyleSheet(
             "font-size: 11px; padding: 4px; background: #2a3a4a; color: #8cf;"
         )
         btn_fi.clicked.connect(self._show_fi_curve)
-        left_layout.addWidget(btn_fi)
+        self._chk_fi = _make_status_checkbox("F-I Curve has been run for this cell")
+        row_fi = QtWidgets.QHBoxLayout()
+        row_fi.addWidget(btn_fi, stretch=1)
+        row_fi.addWidget(self._chk_fi)
+        left_layout.addLayout(row_fi)
+
+        btn_ramp = QtWidgets.QPushButton("Analyze Ramp APs")
+        btn_ramp.setStyleSheet(
+            "font-size: 11px; padding: 4px; background: #3a2a4a; color: #c8f;"
+        )
+        btn_ramp.clicked.connect(self._run_ramp_analysis)
+        self._chk_ramp = _make_status_checkbox("Ramp AP analysis has been run for this cell")
+        row_ramp = QtWidgets.QHBoxLayout()
+        row_ramp.addWidget(btn_ramp, stretch=1)
+        row_ramp.addWidget(self._chk_ramp)
+        left_layout.addLayout(row_ramp)
 
         btn_avg = QtWidgets.QPushButton("Average && Analyze Subthreshold")
         btn_avg.setStyleSheet(
             "font-size: 11px; padding: 4px; background: #2a4a2a; color: #8f8;"
         )
         btn_avg.clicked.connect(self._run_average_analysis)
-        left_layout.addWidget(btn_avg)
+        self._chk_avg = _make_status_checkbox("Average subthreshold analysis has been run for this cell")
+        row_avg = QtWidgets.QHBoxLayout()
+        row_avg.addWidget(btn_avg, stretch=1)
+        row_avg.addWidget(self._chk_avg)
+        left_layout.addLayout(row_avg)
 
         btn_passive = QtWidgets.QPushButton("Analyze Each Sweep (Passive)")
         btn_passive.setStyleSheet(
             "font-size: 11px; padding: 4px; background: #2a4a3a; color: #8fb;"
         )
         btn_passive.clicked.connect(self._run_per_sweep_passive_analysis)
-        left_layout.addWidget(btn_passive)
+        self._chk_passive = _make_status_checkbox("Per-sweep passive analysis has been run for this cell")
+        row_passive = QtWidgets.QHBoxLayout()
+        row_passive.addWidget(btn_passive, stretch=1)
+        row_passive.addWidget(self._chk_passive)
+        left_layout.addLayout(row_passive)
+
+        btn_vrest = QtWidgets.QPushButton("Measure V_rest")
+        btn_vrest.setStyleSheet(
+            "font-size: 11px; padding: 4px; background: #2a3a2a; color: #af8;"
+        )
+        btn_vrest.clicked.connect(self._run_vrest_analysis)
+        self._chk_vrest = _make_status_checkbox("Resting potential has been measured for this cell")
+        row_vrest = QtWidgets.QHBoxLayout()
+        row_vrest.addWidget(btn_vrest, stretch=1)
+        row_vrest.addWidget(self._chk_vrest)
+        left_layout.addLayout(row_vrest)
 
         btn_clear = QtWidgets.QPushButton("Clear Plot")
         btn_clear.setStyleSheet("font-size: 11px; padding: 3px;")
@@ -378,6 +436,8 @@ class TraceViewer:
         file_menu = mb.addMenu("File")
         act_session = file_menu.addAction("Open Session…")
         act_session.triggered.connect(self._on_open_session)
+        act_new_cell = file_menu.addAction("New Cell…")
+        act_new_cell.triggered.connect(self._on_new_cell)
         act_open = file_menu.addAction("Open Directory…")
         act_open.triggered.connect(self._on_open_directory)
         file_menu.addSeparator()
@@ -733,10 +793,12 @@ class TraceViewer:
 
         epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
         dvdt_thresh = self._dvdt_spin.value()
+        peak_window = self._peak_window_spin.value()
         try:
             result = run_spike_detection(
                 col, epoch_index=epoch_idx,
                 dvdt_detection_mVms=dvdt_thresh,
+                peak_search_window_ms=peak_window,
             )
         except Exception as exc:
             self._results_box.setPlainText(f"Spike detection error:\n{exc}")
@@ -747,6 +809,7 @@ class TraceViewer:
             "collection_name": self._current_collection.name,
             "epoch_index": epoch_idx,
             "dvdt_detection_mVms": dvdt_thresh,
+            "peak_search_window_ms": peak_window,
             "source_sweeps": [{"filename": r.filename, "sweep_index": r.sweep_index}
                                for r in refs],
         }
@@ -810,12 +873,161 @@ class TraceViewer:
         if slope == slope:
             msg_parts.append(f"F-I slope: {slope:.4f} Hz/pA")
         self._results_box.setPlainText("\n".join(msg_parts) if msg_parts else "F-I analysis complete.")
+        self._refresh_analysis_checks()
 
         self._fi_viewer = FICurveViewer(
             fi_result=fi_result,
             title=f"{self._cell.cell_id} — F-I Curve",
         )
         self._fi_viewer.show()
+
+    def _run_ramp_analysis(self) -> None:
+        from pyqtgraph.Qt import QtWidgets
+        from wholecell.core.sweep_collection import SweepCollection, SweepRef
+        from wholecell.analysis.ramp import run_ramp_analysis
+
+        if self._current_collection is None:
+            self._results_box.setPlainText("No active collection.")
+            return
+
+        spikes_results = self._cell.results.get("spikes", [])
+        if not spikes_results:
+            self._results_box.setPlainText(
+                "No spike detection results found.\nRun Find Spikes first."
+            )
+            return
+
+        checked = self._checked_sweeps()
+        if not checked:
+            self._results_box.setPlainText("No sweeps checked.")
+            return
+
+        refs = [self._ref_at(pos) for pos in checked]
+        col = SweepCollection(
+            name="_viewer_ramp_temp",
+            sweeps=refs,
+            recordings=self._cell.recordings,
+        )
+
+        epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
+        lowpass = self._default_lowpass_hz if self._filter_on else None
+        spike_entry = spikes_results[-1]
+
+        try:
+            result = run_ramp_analysis(col, epoch_idx, spike_entry, lowpass_hz=lowpass)
+        except Exception as exc:
+            self._results_box.setPlainText(f"Ramp AP analysis error:\n{exc}")
+            return
+
+        self._cell._store_result("ramp_evoked_APs", result, {
+            "collection_name": self._current_collection.name,
+            "epoch_index": epoch_idx,
+            "lowpass_hz": lowpass,
+            "n_sweeps": len(checked),
+            "source": "ramp_analysis",
+        })
+
+        per_sweep = result.get("per_sweep", [])
+        cell_level = result.get("cell_level", {})
+        filt_str = f"LP {lowpass:.0f} Hz" if lowpass else "raw"
+
+        hdr = (
+            f"{'Sw':>3}  {'I_thr(pA)':>9}  {'Vthr(mV)':>8}  "
+            f"{'Vpk(mV)':>8}  {'HW(ms)':>6}  {'Ht(mV)':>7}"
+        )
+        sep = "─" * len(hdr)
+        rows_txt = [f"N={len(per_sweep)}  Filter={filt_str}", sep, hdr, sep]
+
+        def _fmt(v, fmt=".1f"):
+            try:
+                return f"{float(v):{fmt}}" if float(v) == float(v) else "   NaN"
+            except (TypeError, ValueError):
+                return "   NaN"
+
+        for r in per_sweep:
+            rows_txt.append(
+                f"{r.get('sweep_index', '?'):>3}  "
+                f"{_fmt(r.get('current_at_threshold_pA')):>9}  "
+                f"{_fmt(r.get('threshold_voltage_mV')):>8}  "
+                f"{_fmt(r.get('peak_voltage_mV')):>8}  "
+                f"{_fmt(r.get('half_width_ms')):>6}  "
+                f"{_fmt(r.get('height_mV')):>7}"
+            )
+
+        rows_txt.append(sep)
+        mean_thr = cell_level.get("mean_threshold_voltage_mV", float("nan"))
+        std_thr = cell_level.get("std_threshold_voltage_mV", float("nan"))
+        mean_i = cell_level.get("mean_current_at_threshold_pA", float("nan"))
+        std_i = cell_level.get("std_current_at_threshold_pA", float("nan"))
+        mean_hw = cell_level.get("mean_half_width_ms", float("nan"))
+        std_hw = cell_level.get("std_half_width_ms", float("nan"))
+
+        if mean_thr == mean_thr:
+            rows_txt.append(f"Threshold  mean ± SD : {mean_thr:.1f} ± {std_thr:.1f} mV")
+        if mean_i == mean_i:
+            rows_txt.append(f"I at thr   mean ± SD : {mean_i:.1f} ± {std_i:.1f} pA")
+        if mean_hw == mean_hw:
+            rows_txt.append(f"Half-width mean ± SD : {mean_hw:.2f} ± {std_hw:.2f} ms")
+
+        self._results_box.setPlainText("\n".join(rows_txt))
+        self._refresh_analysis_checks()
+
+    def _run_vrest_analysis(self) -> None:
+        from wholecell.core.sweep_collection import SweepCollection, SweepRef
+        from wholecell.analysis.vrest import run_vrest_analysis
+
+        if self._current_collection is None:
+            self._results_box.setPlainText("No active collection.")
+            return
+
+        checked = self._checked_sweeps()
+        if not checked:
+            self._results_box.setPlainText("No sweeps checked.")
+            return
+
+        refs = [self._ref_at(pos) for pos in checked]
+        col = SweepCollection(
+            name="_viewer_vrest_temp",
+            sweeps=refs,
+            recordings=self._cell.recordings,
+        )
+
+        lowpass = self._default_lowpass_hz if self._filter_on else None
+
+        try:
+            result = run_vrest_analysis(col, lowpass_hz=lowpass)
+        except Exception as exc:
+            self._results_box.setPlainText(f"V_rest analysis error:\n{exc}")
+            return
+
+        self._cell._store_result("v_rest", result, {
+            "collection_name": self._current_collection.name,
+            "lowpass_hz": lowpass,
+            "n_sweeps": len(checked),
+            "source": "vrest_analysis",
+        })
+
+        per_sweep = result.get("per_sweep", [])
+        cell_level = result.get("cell_level", {})
+        filt_str = f"LP {lowpass:.0f} Hz" if lowpass else "raw"
+
+        hdr = f"{'Sw':>3}  {'V_rest (mV)':>11}"
+        sep = "─" * len(hdr)
+        rows_txt = [f"N={len(per_sweep)}  Filter={filt_str}", sep, hdr, sep]
+
+        for r in per_sweep:
+            v = r.get("v_rest_mV", float("nan"))
+            v_str = f"{v:.2f}" if v == v else "   NaN"
+            rows_txt.append(f"{r.get('sweep_index', '?'):>3}  {v_str:>11}")
+
+        rows_txt.append(sep)
+        v_mean = cell_level.get("v_rest_mV", float("nan"))
+        v_std = cell_level.get("v_rest_std_mV", float("nan"))
+        if v_mean == v_mean:
+            rows_txt.append(f"V_rest  mean ± SD : {v_mean:.2f} ± {v_std:.2f} mV")
+
+        self._results_box.setPlainText("\n".join(rows_txt))
+        self._refresh_analysis_checks()
 
     def _update_spike_markers(self) -> None:
         visible = self._show_spikes and bool(self._spike_data)
@@ -1070,6 +1282,7 @@ class TraceViewer:
             f"Sag τ             : {sag['sag_tau_ms']:.1f} ms",
         ]
         self._results_box.setPlainText("\n".join(lines))
+        self._refresh_analysis_checks()
 
     def _run_per_sweep_passive_analysis(self) -> None:
         """Analyze each checked sweep individually (no averaging).
@@ -1181,6 +1394,14 @@ class TraceViewer:
             rows_txt.append(f"τ_m    mean ± SD : {tau_mean:.2f} ± {tau_sd:.2f} ms")
 
         self._results_box.setPlainText("\n".join(rows_txt))
+        self._refresh_analysis_checks()
+
+    def _refresh_analysis_checks(self) -> None:
+        self._chk_fi.setChecked(bool(self._cell.results.get("fi_curve")))
+        self._chk_ramp.setChecked(bool(self._cell.results.get("ramp_evoked_APs")))
+        self._chk_avg.setChecked(bool(self._cell.results.get("passive_repeated_step")))
+        self._chk_passive.setChecked(bool(self._cell.results.get("passive_range")))
+        self._chk_vrest.setChecked(bool(self._cell.results.get("v_rest")))
 
     # ------------------------------------------------------------------
     # Analysis helpers
@@ -1320,6 +1541,7 @@ class TraceViewer:
             self._on_collection_changed(first)
 
         self._results_box.setPlainText(f"Session loaded:\n{path}")
+        self._refresh_analysis_checks()
 
     def _on_open_directory(self) -> None:
         from pyqtgraph.Qt import QtWidgets
@@ -1368,6 +1590,72 @@ class TraceViewer:
             self._on_collection_changed(first)
 
         msg = f"Loaded {len(loaded)} file(s)."
+        if errors:
+            msg += "\n\nErrors:\n" + "\n".join(errors)
+        self._results_box.setPlainText(msg)
+
+    def _on_new_cell(self) -> None:
+        from pyqtgraph.Qt import QtWidgets
+        from wholecell.core.cell import Cell
+
+        # Settings are instrument-like — carry them forward
+        saved_dvdt = self._dvdt_spin.value()
+        saved_peak_window = self._peak_window_spin.value()
+
+        dir_path = QtWidgets.QFileDialog.getExistingDirectory(
+            self._win, "Open New Cell Directory", str(self._cell.output_dir),
+        )
+        if not dir_path:
+            return
+
+        abf_files = sorted(Path(dir_path).glob("*.abf"))
+        if not abf_files:
+            QtWidgets.QMessageBox.information(
+                self._win, "No ABF files", f"No .abf files found in:\n{dir_path}"
+            )
+            return
+
+        # Fresh cell model for the new directory
+        self._cell = Cell(cell_id=Path(dir_path).name, output_dir=dir_path)
+
+        # Reset all transient GUI state
+        self._current_collection = None
+        self._cursor = 0
+        self._spike_data.clear()
+        self._tau_lookup.clear()
+        self._avg_tau_fit = None
+        self._curves.clear()
+        self._clear_avg_curves()
+        self._clear_curves()
+        self._results_box.clear()
+        self._cell_id_edit.setText(self._cell.cell_id)
+        self._win.setWindowTitle(f"Trace Viewer — {self._cell.cell_id}")
+
+        # Restore the preserved settings
+        self._dvdt_spin.setValue(saved_dvdt)
+        self._peak_window_spin.setValue(saved_peak_window)
+
+        # Load recordings from the new directory
+        loaded, errors = [], []
+        for abf_path in abf_files:
+            try:
+                self._cell.add_recording(abf_path)
+                loaded.append(abf_path.stem)
+            except Exception as exc:
+                errors.append(f"{abf_path.stem}: {exc}")
+
+        self._auto_create_collections(loaded)
+        self._build_file_tree()
+        self._update_collections_combo()
+
+        if loaded:
+            first = loaded[0]
+            idx = self._collections_combo.findText(first)
+            if idx >= 0:
+                self._collections_combo.setCurrentIndex(idx)
+            self._on_collection_changed(first)
+
+        msg = f"New cell loaded — {len(loaded)} file(s)."
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
         self._results_box.setPlainText(msg)
