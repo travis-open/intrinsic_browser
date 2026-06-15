@@ -20,6 +20,9 @@ import numpy as np
 
 from wholecell.core.sweep_collection import SweepCollection, SweepRef
 from wholecell.analysis.spikes.base import build_spike_finder, SpikeDetection
+from wholecell.filters.lowpass import apply_lowpass
+
+_DETECTION_LOWPASS_HZ = 2000.0
 
 
 def run_spike_detection(
@@ -121,9 +124,16 @@ def _detect_in_sweep(
     dict
         Per-sweep result dict (see run_spike_detection docstring).
     """
-    time, voltage, current = collection.get_sweep_arrays(ref, lowpass_hz=lowpass_hz)
+    time, voltage, current = collection.get_sweep_arrays(ref)
 
     rec = collection._recordings[ref.filename]
+
+    # Always apply a 2 kHz lowpass for detection, regardless of caller preference.
+    # This prevents noise spikes on the downstroke from fooling the trough finder.
+    # Feature extraction (features.py) applies its own filter independently.
+    nyquist = (1.0 / (time[1] - time[0])) / 2.0
+    if _DETECTION_LOWPASS_HZ < nyquist:
+        voltage = apply_lowpass(voltage, nyquist * 2.0, _DETECTION_LOWPASS_HZ)
     epoch = rec.get_epoch(ref.sweep_index, epoch_index)
     epoch_start_s = epoch.start_time_s
     epoch_end_s = epoch.end_time_s

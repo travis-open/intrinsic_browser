@@ -98,6 +98,7 @@ class DerivativeSpikeFinder(SpikeFinder):
         min_peak_voltage_mV: float = -20.0,
         dvdt_local_window_ms: float = 10.0,
         min_local_dvdt_for_fallback: float = 50.0,
+        min_rise_samples: int = 3,
     ) -> None:
         self.dvdt_detection_mVms = dvdt_detection_mVms
         self.dvdt_threshold_pct = dvdt_threshold_pct
@@ -107,6 +108,7 @@ class DerivativeSpikeFinder(SpikeFinder):
         self.min_peak_voltage_mV = min_peak_voltage_mV
         self.dvdt_local_window_ms = dvdt_local_window_ms
         self.min_local_dvdt_for_fallback = min_local_dvdt_for_fallback
+        self.min_rise_samples = min_rise_samples
 
     @property
     def backend_name(self) -> str:
@@ -124,6 +126,7 @@ class DerivativeSpikeFinder(SpikeFinder):
             "min_peak_voltage_mV": self.min_peak_voltage_mV,
             "dvdt_local_window_ms": self.dvdt_local_window_ms,
             "min_local_dvdt_for_fallback": self.min_local_dvdt_for_fallback,
+            "min_rise_samples": self.min_rise_samples,
         }
 
     def detect(
@@ -195,7 +198,7 @@ class DerivativeSpikeFinder(SpikeFinder):
 
             # Find fast trough: first local minimum after peak
             trough_end = min(peak_idx + trough_window_samples, len(voltage))
-            trough_idx = self._find_trough(voltage, peak_idx, trough_end)
+            trough_idx = self._find_trough(voltage, peak_idx, trough_end, self.min_rise_samples)
 
             last_peak_index = peak_idx
 
@@ -246,12 +249,13 @@ class DerivativeSpikeFinder(SpikeFinder):
         voltage: np.ndarray,
         start_idx: int,
         end_idx: int,
+        min_rise_samples: int = 3,
     ) -> int:
-        """Find the fast trough (first local min) after the spike peak.
+        """Find the fast trough (first sustained local min) after the spike peak.
 
-        Walks forward from start_idx looking for the first sample where
-        voltage starts to increase again. Falls back to argmin in the
-        window if no local minimum is found before end_idx.
+        Requires voltage to rise for ``min_rise_samples`` consecutive samples
+        before declaring a trough, preventing single noisy upward ticks on the
+        downstroke from triggering a premature return.
 
         Parameters
         ----------
@@ -260,15 +264,22 @@ class DerivativeSpikeFinder(SpikeFinder):
             Index just after the peak.
         end_idx : int
             Maximum index to search (exclusive).
+        min_rise_samples : int
+            Number of consecutive rising samples required to confirm a trough.
 
         Returns
         -------
         int
             Index of the trough within voltage.
         """
+        consecutive_rises = 0
         for i in range(start_idx, end_idx - 1):
             if voltage[i + 1] > voltage[i]:
-                return i
+                consecutive_rises += 1
+                if consecutive_rises >= min_rise_samples:
+                    return i + 1 - min_rise_samples
+            else:
+                consecutive_rises = 0
         # Fallback: absolute minimum in window
         window = voltage[start_idx:end_idx]
         return start_idx + int(np.argmin(window))
