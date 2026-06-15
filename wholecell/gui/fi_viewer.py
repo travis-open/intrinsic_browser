@@ -39,6 +39,7 @@ class FICurveViewer:
         self._peak_rates = fi_curve.get("peak_rate_hz", [])
         self._rheobase = cell_level.get("rheobase_pA", float("nan"))
         self._slope = cell_level.get("fi_slope_hz_per_pA", float("nan"))
+        self._intercept = cell_level.get("fi_slope_intercept_hz", float("nan"))
         self._r2 = cell_level.get("fi_slope_r2", float("nan"))
         self._slope_n = cell_level.get("fi_slope_n_points", 0)
         self._max_rate = cell_level.get("max_firing_rate_hz", float("nan"))
@@ -150,25 +151,17 @@ class FICurveViewer:
         if (
             show_mean
             and not math.isnan(self._slope)
+            and not math.isnan(self._intercept)
             and self._slope_n >= 2
             and currents
         ):
             supra = [c for c in currents if not math.isnan(self._rheobase) and c >= self._rheobase]
             if supra:
-                # Fit was over first slope_n points above rheobase
                 fit_currents = sorted(supra)[: self._slope_n]
                 if fit_currents:
                     c_min, c_max = fit_currents[0], fit_currents[-1]
-                    # Compute intercept: slope*rheobase gives rate at rheobase (≈0 for clean step)
-                    # Re-derive from mean rates at the fitted points instead
-                    mean_rate_at_rheobase = 0.0
-                    for c, r in zip(currents, self._mean_rates):
-                        if abs(c - c_min) < 1e-3:
-                            mean_rate_at_rheobase = r
-                            break
-                    intercept = mean_rate_at_rheobase - self._slope * c_min
                     fit_x = [c_min, c_max]
-                    fit_y = [self._slope * x + intercept for x in fit_x]
+                    fit_y = [self._slope * x + self._intercept for x in fit_x]
                     pw.plot(
                         fit_x,
                         fit_y,

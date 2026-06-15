@@ -175,6 +175,7 @@ def _compute_cell_level_fi(per_sweep: list[dict]) -> dict:
     )
 
     fi_slope_hz_per_pA = float("nan")
+    fi_slope_intercept_hz = float("nan")
     fi_slope_r2 = float("nan")
     fi_slope_n_points = 0
 
@@ -191,6 +192,7 @@ def _compute_cell_level_fi(per_sweep: list[dict]) -> dict:
             rates = np.array([r["mean_firing_rate_hz"] for r in fit_rows])
             coeffs = np.polyfit(currents, rates, 1)
             fi_slope_hz_per_pA = float(coeffs[0])
+            fi_slope_intercept_hz = float(coeffs[1])
             fi_slope_n_points = len(fit_rows)
 
             # R² = 1 - SS_res / SS_tot
@@ -204,6 +206,7 @@ def _compute_cell_level_fi(per_sweep: list[dict]) -> dict:
         "max_firing_rate_hz": float(max_rate) if not np.isnan(max_rate) else float("nan"),
         "max_peak_instantaneous_rate_hz": float(max_peak_inst),
         "fi_slope_hz_per_pA": fi_slope_hz_per_pA,
+        "fi_slope_intercept_hz": fi_slope_intercept_hz,
         "fi_slope_r2": fi_slope_r2,
         "fi_slope_n_points": fi_slope_n_points,
         "n_steps_analyzed": n,
