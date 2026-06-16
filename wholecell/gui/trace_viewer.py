@@ -365,11 +365,13 @@ class TraceViewer:
 
         self._plot_v = self._pg_widget.addPlot(row=0, col=0)
         self._plot_v.setLabel("left", "Voltage", units="mV")
+        self._plot_v.getAxis("left").enableAutoSIPrefix(False)
         self._plot_v.setLabel("bottom", "Time", units="s")
         self._plot_v.showGrid(x=True, y=True, alpha=0.25)
 
         self._plot_d = self._pg_widget.addPlot(row=1, col=0)
         self._plot_d.setLabel("left", "dV/dt", units="mV/ms")
+        self._plot_d.getAxis("left").enableAutoSIPrefix(False)
         self._plot_d.setLabel("bottom", "Time", units="s")
         self._plot_d.showGrid(x=True, y=True, alpha=0.25)
         self._plot_d.setXLink(self._plot_v)
@@ -377,6 +379,7 @@ class TraceViewer:
 
         self._plot_i = self._pg_widget.addPlot(row=2, col=0)
         self._plot_i.setLabel("left", "Current", units="pA")
+        self._plot_i.getAxis("left").enableAutoSIPrefix(False)
         self._plot_i.setLabel("bottom", "Time", units="s")
         self._plot_i.showGrid(x=True, y=True, alpha=0.25)
         self._plot_i.setXLink(self._plot_v)
@@ -1444,11 +1447,14 @@ class TraceViewer:
             return
 
         self._plot_v.setLabel("left", y_name, units=y_units)
+        self._plot_v.getAxis("left").enableAutoSIPrefix(False)
         self._plot_i.setLabel("left", c_name, units=c_units)
+        self._plot_i.getAxis("left").enableAutoSIPrefix(False)
 
         d_name = f"d({y_name})/dt" if y_name else "dV/dt"
         d_units = f"{y_units}/ms" if y_units else "mV/ms"
         self._plot_d.setLabel("left", d_name, units=d_units)
+        self._plot_d.getAxis("left").enableAutoSIPrefix(False)
 
     # ------------------------------------------------------------------
     # Analysis helpers
