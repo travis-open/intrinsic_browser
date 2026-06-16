@@ -608,6 +608,7 @@ class TraceViewer:
         if not name or name not in self._cell.collections:
             return
         self._current_collection = self._cell.collections[name]
+        self._update_axis_labels()
 
         # Re-detect step epoch every time the collection changes — different
         # files may have different protocols with the step at a different index.
@@ -1418,6 +1419,36 @@ class TraceViewer:
         self._chk_avg.setChecked(bool(self._cell.results.get("passive_repeated_step")))
         self._chk_passive.setChecked(bool(self._cell.results.get("passive_range")))
         self._chk_vrest.setChecked(bool(self._cell.results.get("v_rest")))
+
+    # ------------------------------------------------------------------
+    # Axis label helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_sweep_label(label: str) -> tuple[str, str]:
+        import re
+        m = re.match(r'^(.*?)\s*\(([^)]+)\)\s*$', label.strip())
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+        return label.strip(), ""
+
+    def _update_axis_labels(self) -> None:
+        if self._current_collection is None:
+            return
+        try:
+            ref = self._current_collection.sweeps[0]
+            rec = self._cell.recordings[ref.filename]
+            y_name, y_units = self._parse_sweep_label(rec.y_label)
+            c_name, c_units = self._parse_sweep_label(rec.c_label)
+        except Exception:
+            return
+
+        self._plot_v.setLabel("left", y_name, units=y_units)
+        self._plot_i.setLabel("left", c_name, units=c_units)
+
+        d_name = f"d({y_name})/dt" if y_name else "dV/dt"
+        d_units = f"{y_units}/ms" if y_units else "mV/ms"
+        self._plot_d.setLabel("left", d_name, units=d_units)
 
     # ------------------------------------------------------------------
     # Analysis helpers

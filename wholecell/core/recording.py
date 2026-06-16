@@ -173,6 +173,32 @@ class Recording:
         """Duration of a single sweep in seconds."""
         return self._abf.sweepLengthSec
 
+    @property
+    def y_label(self) -> str:
+        """Label for primary ADC channel (channel 0), e.g. 'Clamp Current (pA)'."""
+        try:
+            self._abf.setSweep(0, channel=0)
+            return self._abf.sweepLabelY
+        except Exception:
+            return "Signal"
+
+    @property
+    def c_label(self) -> str:
+        """Label for the secondary display channel.
+
+        Uses sweepLabelY of channel 1 when a second ADC channel is present
+        (matching what _get_current_trace plots), otherwise falls back to the
+        DAC command label (sweepLabelC) for single-channel recordings.
+        """
+        try:
+            if self._abf.channelCount > 1:
+                self._abf.setSweep(0, channel=1)
+                return self._abf.sweepLabelY
+            self._abf.setSweep(0, channel=0)
+            return self._abf.sweepLabelC
+        except Exception:
+            return "Command"
+
     # ------------------------------------------------------------------
     # Core data access
     # ------------------------------------------------------------------
