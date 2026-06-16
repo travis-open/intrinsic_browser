@@ -75,15 +75,22 @@ class TraceViewer:
         self,
         cell,
         step_epoch_index: int | None = None,
-        lowpass_hz: float | None = 2000.0,
+        lowpass_hz: float | None = None,
     ) -> None:
         import pyqtgraph as pg
         from pyqtgraph.Qt import QtCore, QtWidgets
+        from wholecell.config import load_settings
 
         self._cell = cell
         self._current_collection = None
         self._step_epoch_index = step_epoch_index
+
+        _cfg = load_settings()
+        if lowpass_hz is None:
+            lowpass_hz = _cfg.get("lowpass_hz", 2000.0)
         self._default_lowpass_hz = lowpass_hz
+        self._cfg_dvdt = _cfg.get("dvdt_threshold_mv_per_ms", 20.0)
+        self._cfg_peak_window = _cfg.get("peak_window_ms", 20.0)
 
         self._cursor = 0
         self._filter_on = False
@@ -219,7 +226,7 @@ class TraceViewer:
         self._dvdt_spin.setRange(1.0, 200.0)
         self._dvdt_spin.setSingleStep(1.0)
         self._dvdt_spin.setDecimals(1)
-        self._dvdt_spin.setValue(20.0)
+        self._dvdt_spin.setValue(self._cfg_dvdt)
         self._dvdt_spin.setSuffix(" mV/ms")
         self._dvdt_spin.setStyleSheet(
             "QDoubleSpinBox { background: #1a1a1a; color: #ddd; font-size: 11px; "
@@ -236,7 +243,7 @@ class TraceViewer:
         self._peak_window_spin.setRange(5.0, 100.0)
         self._peak_window_spin.setSingleStep(1.0)
         self._peak_window_spin.setDecimals(1)
-        self._peak_window_spin.setValue(20.0)
+        self._peak_window_spin.setValue(self._cfg_peak_window)
         self._peak_window_spin.setSuffix(" ms")
         self._peak_window_spin.setStyleSheet(
             "QDoubleSpinBox { background: #1a1a1a; color: #ddd; font-size: 11px; "
@@ -245,6 +252,15 @@ class TraceViewer:
         peak_row.addWidget(peak_lbl)
         peak_row.addWidget(self._peak_window_spin, stretch=1)
         left_layout.addLayout(peak_row)
+
+        # Persist spinbox values whenever the user changes them
+        from wholecell.config import update_setting
+        self._dvdt_spin.valueChanged.connect(
+            lambda v: update_setting("dvdt_threshold_mv_per_ms", v)
+        )
+        self._peak_window_spin.valueChanged.connect(
+            lambda v: update_setting("peak_window_ms", v)
+        )
 
         btn_spikes = QtWidgets.QPushButton("Find Spikes  (S = toggle)")
         btn_spikes.setStyleSheet(
@@ -1545,10 +1561,12 @@ class TraceViewer:
 
     def _on_open_directory(self) -> None:
         from pyqtgraph.Qt import QtWidgets
+        from wholecell.config import get_default_data_dir
 
+        _real_dir = self._cell.output_dir != Path(".")
+        _start = str(self._cell.output_dir) if _real_dir else str(get_default_data_dir() or "")
         dir_path = QtWidgets.QFileDialog.getExistingDirectory(
-            self._win, "Open Recording Directory",
-            str(self._cell.output_dir),
+            self._win, "Open Recording Directory", _start,
         )
         if not dir_path:
             return
@@ -1602,8 +1620,11 @@ class TraceViewer:
         saved_dvdt = self._dvdt_spin.value()
         saved_peak_window = self._peak_window_spin.value()
 
+        from wholecell.config import get_default_data_dir
+        _real_dir = self._cell.output_dir != Path(".")
+        _start = str(self._cell.output_dir) if _real_dir else str(get_default_data_dir() or "")
         dir_path = QtWidgets.QFileDialog.getExistingDirectory(
-            self._win, "Open New Cell Directory", str(self._cell.output_dir),
+            self._win, "Open New Cell Directory", _start,
         )
         if not dir_path:
             return
@@ -1901,7 +1922,7 @@ def launch_viewer(
     filepath: str | Path | None = None,
     directory: str | Path | None = None,
     cell_id: str | None = None,
-    lowpass_hz: float | None = 2000.0,
+    lowpass_hz: float | None = None,
     epoch_index: int | None = None,
 ) -> None:
     """Open TraceViewer from a single ABF file or a directory.
@@ -1946,9 +1967,11 @@ def launch_viewer(
     else:
         # No path given — open directory dialog
         from pyqtgraph.Qt import QtWidgets
+        from wholecell.config import get_default_data_dir
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+        _start = str(get_default_data_dir() or "")
         dir_path = QtWidgets.QFileDialog.getExistingDirectory(
-            None, "Select Recording Directory"
+            None, "Select Recording Directory", _start
         )
         if not dir_path:
             return
@@ -1960,7 +1983,7 @@ def launch_viewer(
     viewer.run()
 
 
-def launch_from_cell(cell, lowpass_hz: float | None = 2000.0,
+def launch_from_cell(cell, lowpass_hz: float | None = None,
                      epoch_index: int | None = None) -> None:
     """Open TraceViewer from an existing Cell object."""
     viewer = TraceViewer(cell, step_epoch_index=epoch_index, lowpass_hz=lowpass_hz)
@@ -1979,7 +2002,8 @@ def main() -> None:
                         help="Path to an .abf file or a directory of .abf files. "
                              "Opens a directory picker if omitted.")
     parser.add_argument("--cell-id", default=None, help="Cell identifier")
-    parser.add_argument("--lowpass", type=float, default=2000.0)
+    parser.add_argument("--lowpass", type=float, default=None,
+                        help="Lowpass filter cutoff in Hz (default: from ~/.wholecell/settings.json)")
     parser.add_argument("--epoch", type=int, default=None,
                         help="Step epoch index (auto-detected if omitted)")
     args = parser.parse_args()
