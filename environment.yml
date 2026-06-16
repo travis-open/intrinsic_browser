@@ -10,6 +10,9 @@ dependencies:
   - matplotlib
   - pyqt
   - pyqtgraph
+  - jupyterlab
+  - ipykernel
+  - openpyxl
   - pip
   - pip:
     - pyabf
