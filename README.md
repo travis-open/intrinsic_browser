@@ -152,6 +152,30 @@ cell.find_spikes(collection_name="current_steps", epoch_index=1,
 
 ---
 
+## Viewer settings
+
+The interactive viewer reads user preferences from `~/.wholecell/settings.json` (`C:\Users\<you>\.wholecell\settings.json` on Windows).  The file is created automatically the first time a spinbox value is changed in the viewer, or you can create it manually.
+
+```json
+{
+  "default_data_directory": "C:\\Users\\tahage\\Box\\CreedLabBoxDrive",
+  "lowpass_hz": 2000.0,
+  "dvdt_threshold_mv_per_ms": 5.0,
+  "peak_window_ms": 20.0
+}
+```
+
+| Key | What it controls | Default |
+|-----|-----------------|---------|
+| `default_data_directory` | Starting folder for all file-open dialogs | OS default |
+| `lowpass_hz` | Lowpass filter cutoff (toggled with **F**) | `2000.0` |
+| `dvdt_threshold_mv_per_ms` | dV/dt spike-detection threshold | `20.0` |
+| `peak_window_ms` | Search window for spike peak | `20.0` |
+
+Settings are per-user and scoped to the machine, so each person on a shared setup can point at their own data directory without affecting anyone else.  Spinbox changes in the viewer are saved immediately, so your preferred thresholds carry over between sessions automatically.
+
+---
+
 ## Troubleshooting
 
 **`conda: command not found`**
