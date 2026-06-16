@@ -173,6 +173,7 @@ def _analyze_one_sweep(
             row["sag_amplitude_mV"] = sag["sag_amplitude_mV"]
         if "sag_kinetics" in measures:
             row["sag_tau_ms"] = sag.get("sag_tau_ms", float("nan"))
+            row["sag_tau_r2"] = sag.get("sag_tau_r2", float("nan"))
 
     return row
 
@@ -416,6 +417,7 @@ def estimate_sag(
         "sag_ratio": float("nan"),
         "sag_amplitude_mV": float("nan"),
         "sag_tau_ms": float("nan"),
+        "sag_tau_r2": float("nan"),
     }
 
     if len(epoch_voltage) < 10:
@@ -452,6 +454,7 @@ def estimate_sag(
 
     # Optional: fit exponential to the sag relaxation (peak → steady state)
     sag_tau_ms = float("nan")
+    sag_tau_r2 = float("nan")
     try:
         from scipy.optimize import curve_fit
 
@@ -471,6 +474,10 @@ def estimate_sag(
                 maxfev=3000,
             )
             sag_tau_ms = float(popt[2]) * 1000.0
+            fit_predicted = _exp_model(t_sag, *popt)
+            ss_res = float(np.sum((v_sag - fit_predicted) ** 2))
+            ss_tot = float(np.sum((v_sag - np.mean(v_sag)) ** 2))
+            sag_tau_r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
     except Exception:
         pass
 
@@ -478,6 +485,7 @@ def estimate_sag(
         "sag_ratio": sag_ratio,
         "sag_amplitude_mV": sag_amplitude_mV,
         "sag_tau_ms": sag_tau_ms,
+        "sag_tau_r2": sag_tau_r2,
     }
 
 
@@ -548,6 +556,7 @@ def _compute_cell_level(per_sweep: list[dict], measures: list[str]) -> dict:
                 cell["sag_amplitude_mV"] = ref.get("sag_amplitude_mV", float("nan"))
             if "sag_kinetics" in measures:
                 cell["sag_tau_ms"] = ref.get("sag_tau_ms", float("nan"))
+                cell["sag_tau_r2"] = ref.get("sag_tau_r2", float("nan"))
 
     return cell
 
