@@ -23,6 +23,10 @@ from wholecell.analysis.spikes.base import build_spike_finder, SpikeDetection
 from wholecell.filters.lowpass import apply_lowpass
 
 _DETECTION_LOWPASS_HZ = 2000.0
+# Window (±samples) to search in raw voltage when refining the peak index.
+# The lowpass filter rounds the sharp AP peak, shifting filtered argmax by
+# 1-2 samples vs the true raw maximum.  3 samples = 0.15 ms at 20 kHz.
+_PEAK_REFINE_SAMPLES = 3
 
 
 def run_spike_detection(
@@ -152,10 +156,15 @@ def _detect_in_sweep(
 
     all_spikes = finder.detect(time, voltage_det, current)
 
-    # Overwrite voltage values in SpikeDetection objects with raw-trace readings.
-    # The finder used voltage_det (filtered) to locate indices; the values at
-    # those indices must come from voltage_raw so peak/trough are not attenuated.
+    # Refine peak index and overwrite all voltage values from the raw trace.
+    # The 2 kHz filter rounds the sharp AP peak, shifting the filtered argmax
+    # by 1-2 samples vs the true raw maximum.  Re-find the peak in a small
+    # neighborhood of voltage_raw, then read all voltages from that raw trace.
     for sp in all_spikes:
+        lo = max(0, sp.peak_index - _PEAK_REFINE_SAMPLES)
+        hi = min(len(voltage_raw), sp.peak_index + _PEAK_REFINE_SAMPLES + 1)
+        sp.peak_index = lo + int(np.argmax(voltage_raw[lo:hi]))
+        sp.peak_time_s = float(time[sp.peak_index])
         sp.peak_voltage_mV = float(voltage_raw[sp.peak_index])
         sp.threshold_voltage_mV = float(voltage_raw[sp.threshold_index])
         sp.trough_voltage_mV = float(voltage_raw[sp.trough_index])
