@@ -124,16 +124,20 @@ def _detect_in_sweep(
     dict
         Per-sweep result dict (see run_spike_detection docstring).
     """
-    time, voltage, current = collection.get_sweep_arrays(ref)
+    time, voltage_raw, current = collection.get_sweep_arrays(ref)
 
     rec = collection._recordings[ref.filename]
 
-    # Always apply a 2 kHz lowpass for detection, regardless of caller preference.
-    # This prevents noise spikes on the downstroke from fooling the trough finder.
-    # Feature extraction (features.py) applies its own filter independently.
+    # Build a filtered copy for detection logic only (dV/dt, peak/trough search).
+    # voltage_raw is kept intact so that feature values (peak, threshold, trough
+    # voltages) are read from the unfiltered trace — the 2 kHz filter attenuates
+    # the peaks of fast APs and must not bias the stored voltage measurements.
     nyquist = (1.0 / (time[1] - time[0])) / 2.0
     if _DETECTION_LOWPASS_HZ < nyquist:
-        voltage = apply_lowpass(voltage, nyquist * 2.0, _DETECTION_LOWPASS_HZ)
+        voltage_det = apply_lowpass(voltage_raw, nyquist * 2.0, _DETECTION_LOWPASS_HZ)
+    else:
+        voltage_det = voltage_raw
+
     epoch = rec.get_epoch(ref.sweep_index, epoch_index)
     epoch_start_s = epoch.start_time_s
     epoch_end_s = epoch.end_time_s
@@ -146,7 +150,15 @@ def _detect_in_sweep(
 
     current_pA = _epoch_mean_current(current, epoch.start_sample, epoch.end_sample)
 
-    all_spikes = finder.detect(time, voltage, current)
+    all_spikes = finder.detect(time, voltage_det, current)
+
+    # Overwrite voltage values in SpikeDetection objects with raw-trace readings.
+    # The finder used voltage_det (filtered) to locate indices; the values at
+    # those indices must come from voltage_raw so peak/trough are not attenuated.
+    for sp in all_spikes:
+        sp.peak_voltage_mV = float(voltage_raw[sp.peak_index])
+        sp.threshold_voltage_mV = float(voltage_raw[sp.threshold_index])
+        sp.trough_voltage_mV = float(voltage_raw[sp.trough_index])
 
     spike_dicts = [
         _spike_to_dict(sp, ref, i)
@@ -165,11 +177,11 @@ def _detect_in_sweep(
             end = all_spikes[i + 1].threshold_index
         else:
             end = epoch.end_sample
-        end = min(end, len(voltage))
+        end = min(end, len(voltage_raw))
         if end > start:
-            rel = int(np.argmin(voltage[start:end]))
+            rel = int(np.argmin(voltage_raw[start:end]))
             ahp_idx = start + rel
-            sd["slow_ahp_voltage_mV"] = float(voltage[ahp_idx])
+            sd["slow_ahp_voltage_mV"] = float(voltage_raw[ahp_idx])
             sd["slow_ahp_time_s"] = float(time[ahp_idx])
         else:
             sd["slow_ahp_voltage_mV"] = float("nan")
