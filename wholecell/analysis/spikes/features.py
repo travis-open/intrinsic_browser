@@ -362,8 +362,8 @@ def _compute_cell_level_features(
 
     most_spikes = max(by_sweep_adapt.values(), key=len, default=[])
     if len(most_spikes) >= 3:
-        sweep_spikes = sorted(most_spikes, key=lambda r: r.get("threshold_time_s", 0.0))
-        times = [r["threshold_time_s"] for r in sweep_spikes]
+        sweep_spikes = sorted(most_spikes, key=lambda r: r.get("peak_time_s", 0.0))
+        times = [r["peak_time_s"] for r in sweep_spikes]
         isis = [times[i + 1] - times[i] for i in range(len(times) - 1)]
         isi_first, isi_last = isis[0], isis[-1]
         denom = isi_last + isi_first

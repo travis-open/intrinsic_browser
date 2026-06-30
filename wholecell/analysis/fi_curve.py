@@ -116,7 +116,7 @@ def _build_sweep_row(
         if sp.get("epoch_at_threshold") == epoch_index
     ]
 
-    spike_times = [sp["threshold_time_s"] for sp in epoch_spikes]
+    spike_times = [sp["peak_time_s"] for sp in epoch_spikes]
     n_spikes = len(spike_times)
 
     mean_rate_hz = (n_spikes / epoch_duration_s) if epoch_duration_s > 0 else 0.0
