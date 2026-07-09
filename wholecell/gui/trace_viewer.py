@@ -43,6 +43,19 @@ from pathlib import Path
 import numpy as np
 
 
+# Above this sweep count, the file/sweep tree lists a single summary row instead
+# of one checkable item per sweep. Enumerating tens of thousands of QTreeWidget
+# items is slow to build and unwieldy to navigate; the collection model still
+# holds every sweep, so analysis is unaffected.
+MAX_SWEEPS_LISTED = 500
+
+# Hard cap on how many sweeps are drawn at once. Each plotted sweep creates
+# several pyqtgraph items, so rendering thousands of them in one pass hangs the
+# GUI. Only the first MAX_SWEEPS_PLOTTED positions of the active collection are
+# drawn; cursor/solo navigation can still reach any individual sweep.
+MAX_SWEEPS_PLOTTED = 100
+
+
 # ---------------------------------------------------------------------------
 # Colour helpers
 # ---------------------------------------------------------------------------
@@ -98,6 +111,8 @@ class TraceViewer:
         self._show_dvdt = False
         self._show_spikes = False
         self._solo_mode = False
+        self._avg_active = False
+        self._plot_capped = False
 
         # Analysis state — keyed by (filename, sweep_index)
         self._spike_data: dict[tuple[str, int], list] = {}
@@ -390,18 +405,22 @@ class TraceViewer:
 
         # Average trace curves
         self._avg_curve_v = self._plot_v.plot(
-            pen=self._make_pen("#0ff", width=3, alpha=220), name="avg"
+            pen=self._make_pen("#fff", width=3, alpha=255), name="avg"
         )
+        self._avg_curve_v.setZValue(20)
         self._avg_curve_i = self._plot_i.plot(
-            pen=self._make_pen("#0ff", width=2, alpha=200)
+            pen=self._make_pen("#fff", width=2, alpha=255)
         )
+        self._avg_curve_i.setZValue(20)
         self._avg_curve_d = self._plot_d.plot(
-            pen=self._make_pen("#0ff", width=2, alpha=200)
+            pen=self._make_pen("#fff", width=2, alpha=255)
         )
+        self._avg_curve_d.setZValue(20)
         self._avg_tau_curve = self._plot_v.plot(
-            pen=self._make_pen("#ff0", width=2, alpha=200,
+            pen=self._make_pen("#ff8800", width=3, alpha=255,
                                style=QtCore.Qt.PenStyle.DashLine)
         )
+        self._avg_tau_curve.setZValue(21)
 
         # Spike marker scatter plots
         _sp = dict(pen=None, symbolPen=None)
@@ -494,18 +513,27 @@ class TraceViewer:
             file_item.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
             file_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, fname)
 
-            for i in range(rec.n_sweeps):
-                sweep_item = QtWidgets.QTreeWidgetItem([f"  Sweep {i:03d}"])
-                sweep_item.setFlags(
-                    sweep_item.flags()
-                    | QtCore.Qt.ItemFlag.ItemIsUserCheckable
-                    | QtCore.Qt.ItemFlag.ItemIsEnabled
+            if rec.n_sweeps > MAX_SWEEPS_LISTED:
+                # Too many sweeps to list individually — show a single summary
+                # row. Sweeps remain accessible via the file's collection.
+                note = QtWidgets.QTreeWidgetItem(
+                    [f"  {rec.n_sweeps} sweeps — too many to list individually"]
                 )
-                sweep_item.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
-                sweep_item.setData(
-                    0, QtCore.Qt.ItemDataRole.UserRole, (fname, i)
-                )
-                file_item.addChild(sweep_item)
+                note.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+                file_item.addChild(note)
+            else:
+                for i in range(rec.n_sweeps):
+                    sweep_item = QtWidgets.QTreeWidgetItem([f"  Sweep {i:03d}"])
+                    sweep_item.setFlags(
+                        sweep_item.flags()
+                        | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                        | QtCore.Qt.ItemFlag.ItemIsEnabled
+                    )
+                    sweep_item.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
+                    sweep_item.setData(
+                        0, QtCore.Qt.ItemDataRole.UserRole, (fname, i)
+                    )
+                    file_item.addChild(sweep_item)
 
             self._file_tree.addTopLevelItem(file_item)
             file_item.setExpanded(False)
@@ -649,13 +677,18 @@ class TraceViewer:
         self._list.blockSignals(True)
         self._list.clear()
         if self._current_collection:
+            # For very large collections, only the first MAX_SWEEPS_PLOTTED sweeps
+            # are drawn, so default-check just those — otherwise the checkboxes
+            # would claim thousands are shown when the plot is capped.
+            n = self._current_collection.n_sweeps
+            default_checked = n if n <= MAX_SWEEPS_PLOTTED else MAX_SWEEPS_PLOTTED
             for pos, ref in enumerate(self._current_collection.sweeps):
-                self._list.addItem(self._list_item(pos, ref))
+                self._list.addItem(self._list_item(pos, ref, checked=pos < default_checked))
         self._list.blockSignals(False)
         if self._list.count() > 0:
             self._list.setCurrentRow(0)
 
-    def _list_item(self, pos: int, ref):
+    def _list_item(self, pos: int, ref, checked: bool = True):
         from pyqtgraph.Qt import QtCore, QtWidgets
         item = QtWidgets.QListWidgetItem(ref.display_label)
         item.setFlags(
@@ -663,7 +696,9 @@ class TraceViewer:
             | QtCore.Qt.ItemFlag.ItemIsUserCheckable
             | QtCore.Qt.ItemFlag.ItemIsEnabled
         )
-        item.setCheckState(QtCore.Qt.CheckState.Checked)
+        item.setCheckState(
+            QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
+        )
         return item
 
     def _ref_at(self, pos: int):
@@ -687,6 +722,7 @@ class TraceViewer:
                       self._avg_curve_d, self._avg_tau_curve):
             curve.setData([], [])
         self._avg_tau_fit = None
+        self._avg_active = False
 
     def _clear_plot(self) -> None:
         self._check_none()
@@ -708,14 +744,27 @@ class TraceViewer:
             {self._cursor} if self._solo_mode else set(self._checked_sweeps())
         )
 
+        # Bound the number of simultaneously drawn sweeps — rendering thousands
+        # of curves in one pass hangs the GUI. Solo mode is already a single
+        # sweep. Keep the lowest positions so the cap is deterministic.
+        self._plot_capped = len(to_show) > MAX_SWEEPS_PLOTTED
+        if self._plot_capped:
+            to_show = set(sorted(to_show)[:MAX_SWEEPS_PLOTTED])
+
         for pos in list(self._curves.keys()):
             if pos not in to_show:
                 self._remove_curves(pos)
 
         for pos in to_show:
             ref = self._ref_at(pos)
-            color = "#fff" if self._solo_mode else _sweep_color(pos, n)
-            pen = self._make_pen(color, 2 if self._solo_mode else 1, 200)
+            if self._solo_mode:
+                color = "#fff"
+            elif self._avg_active:
+                color = "#888"
+            else:
+                color = _sweep_color(pos, n)
+            alpha = 200 if self._solo_mode else (100 if self._avg_active else 200)
+            pen = self._make_pen(color, 2 if self._solo_mode else 1, alpha)
 
             try:
                 t, v, _ = self._current_collection.get_sweep_arrays(
@@ -728,20 +777,23 @@ class TraceViewer:
                 self._curves[pos] = self._make_curves(pos)
             c = self._curves[pos]
 
+            z = 10 if self._solo_mode else 0
             c["v"].setData(t, v)
             c["v"].setPen(pen)
-            c["v"].setZValue(1)
+            c["v"].setZValue(z)
 
             if self._show_current:
                 t_i, i_arr = self._get_current_trace(pos)
                 c["i"].setData(t_i, i_arr)
                 c["i"].setPen(pen)
+                c["i"].setZValue(z)
             else:
                 c["i"].setData([], [])
 
             if self._show_dvdt:
                 c["d"].setData(t, np.gradient(v, t) / 1000.0)
                 c["d"].setPen(pen)
+                c["d"].setZValue(z)
             else:
                 c["d"].setData([], [])
 
@@ -1164,6 +1216,8 @@ class TraceViewer:
             self._results_box.setPlainText("No active collection.")
             return
 
+        self._avg_active = True
+
         checked = self._checked_sweeps()
         if len(checked) < 1:
             self._results_box.setPlainText("No sweeps checked.")
@@ -1258,6 +1312,7 @@ class TraceViewer:
         else:
             self._avg_tau_fit = None
         self._update_avg_tau()
+        self._full_update()
 
         # Store result on Cell with full provenance
         source_sweeps = [
@@ -1596,6 +1651,112 @@ class TraceViewer:
         self._results_box.setPlainText(f"Session loaded:\n{path}")
         self._refresh_analysis_checks()
 
+    def _large_sweep_note(self, stems: list) -> str:
+        """Return a note about any loaded files whose sweep list was collapsed."""
+        big = [
+            (s, self._cell.recordings[s].n_sweeps)
+            for s in stems
+            if s in self._cell.recordings
+            and self._cell.recordings[s].n_sweeps > MAX_SWEEPS_LISTED
+        ]
+        if not big:
+            return ""
+        lines = [f"{s}: {n} sweeps — sweep list collapsed" for s, n in big]
+        return "\n\nNote:\n" + "\n".join(lines)
+
+    def _load_directory(self, abf_files: list) -> tuple[list, list]:
+        """Load ABF files into the current cell without freezing the GUI.
+
+        Each ``Recording`` is constructed on a background thread while a modal,
+        cancellable progress dialog keeps the window responsive. Registration
+        into the Cell happens back on the main thread after loading completes, so
+        the Cell is only ever mutated from the GUI thread.
+
+        Returns
+        -------
+        (loaded, errors) : tuple[list[str], list[str]]
+            Stems successfully loaded, and ``"<stem>: <error>"`` strings.
+        """
+        from pyqtgraph.Qt import QtCore, QtWidgets
+
+        class _DirectoryLoader(QtCore.QObject):
+            progress = QtCore.Signal(int)   # files completed so far
+            label = QtCore.Signal(str)      # status text
+            finished = QtCore.Signal()
+
+            def __init__(self, files, existing):
+                super().__init__()
+                self._files = files
+                self._existing = set(existing)
+                self._cancelled = False
+                # (stem, Recording|None, error|None) — written on worker thread,
+                # read on the main thread only after `finished`.
+                self.results: list = []
+
+            def cancel(self):
+                self._cancelled = True
+
+            def run(self):
+                from wholecell.core.recording import Recording
+                total = len(self._files)
+                for idx, path in enumerate(self._files):
+                    if self._cancelled:
+                        break
+                    stem = path.stem
+                    self.label.emit(f"Loading {stem}  ({idx + 1}/{total})…")
+                    if stem not in self._existing:
+                        try:
+                            self.results.append((stem, Recording(path), None))
+                        except Exception as exc:
+                            self.results.append((stem, None, str(exc)))
+                    self.progress.emit(idx + 1)
+                self.finished.emit()
+
+        total = len(abf_files)
+        dlg = QtWidgets.QProgressDialog(
+            "Loading recordings…", "Cancel", 0, total, self._win
+        )
+        dlg.setWindowTitle("Loading")
+        dlg.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+
+        thread = QtCore.QThread()
+        worker = _DirectoryLoader(abf_files, list(self._cell.recordings.keys()))
+        worker.moveToThread(thread)
+
+        # dlg is a main-thread QObject, so cross-thread signals to its slots are
+        # delivered on the GUI thread (queued). Cancel sets a flag directly.
+        worker.progress.connect(dlg.setValue)
+        worker.label.connect(dlg.setLabelText)
+        dlg.canceled.connect(worker.cancel, QtCore.Qt.ConnectionType.DirectConnection)
+
+        loop = QtCore.QEventLoop()
+        worker.finished.connect(loop.quit)
+        thread.started.connect(worker.run)
+        thread.start()
+        dlg.show()
+        loop.exec()  # nested loop: GUI stays live while the worker loads
+
+        thread.quit()
+        thread.wait()
+        dlg.close()
+
+        # Register on the main thread now that the worker has stopped.
+        loaded, errors = [], []
+        for stem, rec, err in worker.results:
+            if err is not None:
+                errors.append(f"{stem}: {err}")
+                continue
+            try:
+                self._cell.register_recording(rec)
+                loaded.append(stem)
+            except Exception as exc:
+                errors.append(f"{stem}: {exc}")
+        worker.deleteLater()
+        return loaded, errors
+
     def _on_open_directory(self) -> None:
         from pyqtgraph.Qt import QtWidgets
         from wholecell.config import get_default_data_dir
@@ -1616,17 +1777,7 @@ class TraceViewer:
             )
             return
 
-        loaded = []
-        errors = []
-        for abf_path in abf_files:
-            stem = abf_path.stem
-            if stem in self._cell.recordings:
-                continue
-            try:
-                self._cell.add_recording(abf_path)
-                loaded.append(stem)
-            except Exception as exc:
-                errors.append(f"{stem}: {exc}")
+        loaded, errors = self._load_directory(abf_files)
 
         self._cell.output_dir = Path(dir_path)
 
@@ -1647,6 +1798,7 @@ class TraceViewer:
         msg = f"Loaded {len(loaded)} file(s)."
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
+        msg += self._large_sweep_note(loaded)
         self._results_box.setPlainText(msg)
 
     def _on_new_cell(self) -> None:
@@ -1699,13 +1851,7 @@ class TraceViewer:
         self._peak_window_spin.setValue(saved_peak_window)
 
         # Load recordings from the new directory
-        loaded, errors = [], []
-        for abf_path in abf_files:
-            try:
-                self._cell.add_recording(abf_path)
-                loaded.append(abf_path.stem)
-            except Exception as exc:
-                errors.append(f"{abf_path.stem}: {exc}")
+        loaded, errors = self._load_directory(abf_files)
 
         self._auto_create_collections(loaded)
         self._build_file_tree()
@@ -1721,6 +1867,7 @@ class TraceViewer:
         msg = f"New cell loaded — {len(loaded)} file(s)."
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
+        msg += self._large_sweep_note(loaded)
         self._results_box.setPlainText(msg)
 
     def _on_save_session(self) -> None:
@@ -1843,9 +1990,13 @@ class TraceViewer:
                     if self._filter_on else "raw")
         epoch_str = (str(self._step_epoch_index)
                      if self._step_epoch_index is not None else "?")
+        cap_str = (
+            f" | Plotting first {MAX_SWEEPS_PLOTTED} of {len(checked)} (capped)"
+            if self._plot_capped else ""
+        )
         self._status.setText(
             f"Collection: {self._current_collection.name} | "
-            f"Cursor: pos {self._cursor} | Overlaid: {len(checked)} | "
+            f"Cursor: pos {self._cursor} | Overlaid: {len(checked)}{cap_str} | "
             f"Step epoch: {epoch_str} | {filt_str} | "
             f"[↑↓ navigate | Space pin | A/N all/none | F filter | C current | D dV/dt | Q quit]"
         )

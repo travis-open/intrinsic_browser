@@ -132,6 +132,30 @@ class Cell:
         Recording('cell_01_steps', 12 sweeps, 20000 Hz)
         """
         rec = Recording(filepath)
+        return self.register_recording(rec)
+
+    def register_recording(self, rec: Recording) -> Recording:
+        """Register an already-constructed Recording with this Cell.
+
+        Split out from :meth:`add_recording` so that the expensive
+        ``Recording(filepath)`` construction can run off the GUI thread while the
+        (cheap) registration happens back on the main thread.
+
+        Parameters
+        ----------
+        rec : Recording
+            A Recording instance to register.
+
+        Returns
+        -------
+        Recording
+            The same Recording, now registered.
+
+        Raises
+        ------
+        ValueError
+            If a recording with the same filename stem is already loaded.
+        """
         if rec.filename in self.recordings:
             raise ValueError(
                 f"A recording named '{rec.filename}' is already loaded. "

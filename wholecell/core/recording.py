@@ -137,6 +137,15 @@ class Recording:
         self._qc_metrics: list[SweepQCMetrics] = []
         self._epochs_cache: dict[int, list[EpochInfo]] = {}
 
+        # Per-sweep epoch waveforms, built once (see _load). pyabf rebuilds this
+        # table on every setSweep() and each build iterates all sweeps, which is
+        # O(n_sweeps) — computing it once and indexing avoids O(n_sweeps^2) loads.
+        self._epoch_waveforms = None
+        # True when every sweep has the same sample length (the common case),
+        # which lets us read sweep data by slicing self._abf.data directly
+        # instead of calling setSweep().
+        self._fixed_length_sweeps = True
+
         self._load()
 
     # ------------------------------------------------------------------
@@ -237,9 +246,8 @@ class Recording:
         """
         self._validate_sweep_index(sweep_index)
 
-        self._abf.setSweep(sweep_index, channel=0)
-        time = self._abf.sweepX.copy()
-        voltage = self._abf.sweepY.copy()
+        time = self._sweep_time(sweep_index)
+        voltage = self._channel_data(sweep_index, channel=0).copy()
 
         current = self._get_current_array(sweep_index)
 
@@ -414,10 +422,55 @@ class Recording:
                 f"pyabf could not open '{self.filepath}': {exc}"
             ) from exc
 
+        # Detect variable-length sweeps once. Fixed-length is the common case and
+        # lets us slice self._abf.data directly for per-sweep reads.
+        if self.n_sweeps > 1 and hasattr(self._abf, "_synchArraySection"):
+            lengths = set(self._abf._synchArraySection.lLength)
+            self._fixed_length_sweeps = len(lengths) == 1
+
+        # Build the per-sweep epoch waveform table exactly once. This is the same
+        # object pyabf produces on each setSweep (epochTable.epochWaveformsBySweep),
+        # with per-sweep level/duration deltas already applied — so indexing it is
+        # behaviour-identical to setSweep() but avoids the O(n_sweeps^2) rebuild.
+        try:
+            import pyabf.waveform
+            self._epoch_waveforms = (
+                pyabf.waveform.EpochTable(self._abf, 0).epochWaveformsBySweep
+            )
+        except Exception:
+            self._epoch_waveforms = None
+
         self._qc_metrics = [
             self._compute_qc(sweep_index)
             for sweep_index in range(self.n_sweeps)
         ]
+
+    def _channel_data(self, sweep_index: int, channel: int) -> np.ndarray:
+        """Return the raw data for one sweep/channel without calling setSweep.
+
+        For fixed-length sweeps this slices ``self._abf.data`` directly (mirroring
+        pyabf's own bounds logic), avoiding the expensive per-call ``EpochTable``
+        rebuild inside ``setSweep``. Falls back to ``setSweep`` for the rare
+        variable-length case.
+
+        Returns a view into ``self._abf.data``; callers that mutate or retain the
+        array should ``.copy()`` it.
+        """
+        if self._fixed_length_sweeps:
+            n = self._abf.sweepPointCount
+            start = n * sweep_index
+            return self._abf.data[channel, start:start + n]
+        # Variable-length sweeps: let pyabf resolve the bounds.
+        self._abf.setSweep(sweep_index, channel=channel)
+        return self._abf.sweepY
+
+    def _sweep_time(self, sweep_index: int) -> np.ndarray:
+        """Return the time axis (s from sweep onset) for one sweep."""
+        if self._fixed_length_sweeps:
+            n = self._abf.sweepPointCount
+        else:
+            n = len(self._channel_data(sweep_index, 0))
+        return np.arange(n) * self._abf.dataSecPerPoint
 
     def _compute_qc(self, sweep_index: int) -> SweepQCMetrics:
         """Compute QC metrics for one sweep.
@@ -437,8 +490,7 @@ class Recording:
             n_samples_100ms = int(0.1 * self.sampling_rate_hz)
             start, end = 0, n_samples_100ms
 
-        self._abf.setSweep(sweep_index, channel=0)
-        baseline_v = self._abf.sweepY[start:end]
+        baseline_v = self._channel_data(sweep_index, channel=0)[start:end]
 
         starting_voltage = float(np.mean(baseline_v)) if len(baseline_v) > 0 else float("nan")
         rms_noise = float(np.std(baseline_v)) if len(baseline_v) > 0 else float("nan")
@@ -459,8 +511,7 @@ class Recording:
         """Return the current channel array, or NaN array if unavailable."""
         if self._abf.channelCount > 1:
             try:
-                self._abf.setSweep(sweep_index, channel=1)
-                return self._abf.sweepY.copy()
+                return self._channel_data(sweep_index, channel=1).copy()
             except Exception:
                 pass
         n = int(self.sweep_duration_s * self.sampling_rate_hz)
@@ -475,67 +526,67 @@ class Recording:
         """Return mean holding current over a sample window, or None."""
         if self._abf.channelCount > 1:
             try:
-                self._abf.setSweep(sweep_index, channel=1)
-                segment = self._abf.sweepY[start_sample:end_sample]
+                segment = self._channel_data(sweep_index, channel=1)[start_sample:end_sample]
                 if len(segment) > 0:
                     return float(np.mean(segment))
             except Exception:
                 pass
         return None
 
+    def _epochs_from_waveform(self, se) -> list[EpochInfo]:
+        """Build EpochInfo list from a pyabf EpochSweepWaveform for one sweep.
+
+        ``se`` exposes parallel lists ``p1s`` (start samples), ``p2s`` (end
+        samples), ``levels`` (per-sweep command level) and ``types`` (epoch type
+        strings). ``delta_level`` is 0.0 because ``levels`` already carries the
+        per-sweep value.
+        """
+        epochs: list[EpochInfo] = []
+        for i, (p1, p2, level, ep_type) in enumerate(
+            zip(se.p1s, se.p2s, se.levels, se.types)
+        ):
+            epochs.append(EpochInfo(
+                epoch_index=i,
+                epoch_type=ep_type,
+                start_sample=p1,
+                end_sample=p2,
+                start_time_s=p1 / self.sampling_rate_hz,
+                end_time_s=p2 / self.sampling_rate_hz,
+                level=float(level),
+                delta_level=0.0,
+            ))
+        return epochs
+
     def _parse_epochs(self, sweep_index: int) -> list[EpochInfo]:
         """Parse epoch information for one sweep.
 
-        Tries ``epochTable`` first (present on most ABF2 files with a full DAC
-        waveform editor entry); falls back to ``sweepEpochs`` which is always
-        populated by pyabf after ``setSweep``.
+        Reads the per-sweep epoch waveform (``.p1s/.p2s/.levels/.types``) built
+        once at load time. This is the same object pyabf sets as ``sweepEpochs``
+        after ``setSweep``, with per-sweep level/duration deltas already applied —
+        so cross-sweep differences (e.g. stepped current ladders) are preserved —
+        but without the O(n_sweeps) rebuild on every access.
+
+        Falls back to ``setSweep`` + ``sweepEpochs`` if the cached table could not
+        be built (variable/unusual protocols).
 
         Raises
         ------
         RuntimeError
             If no epoch information can be found.
         """
-        self._abf.setSweep(sweep_index)
+        # --- Primary path: cached per-sweep epoch waveforms ---
+        if self._epoch_waveforms is not None:
+            try:
+                epochs = self._epochs_from_waveform(self._epoch_waveforms[sweep_index])
+                if epochs:
+                    return epochs
+            except (IndexError, AttributeError):
+                pass
 
-        # --- Primary path: epochTable (has deltaLevel per epoch) ---
+        # --- Fallback: sweepEpochs (rebuilt via setSweep) ---
         try:
-            epoch_table = self._abf.epochTable
-            epochs: list[EpochInfo] = []
-            for i, ep in enumerate(epoch_table.epochs):
-                start_s = ep.p1 / self.sampling_rate_hz
-                end_s = ep.p2 / self.sampling_rate_hz
-                epochs.append(EpochInfo(
-                    epoch_index=i,
-                    epoch_type=ep.epochType,
-                    start_sample=ep.p1,
-                    end_sample=ep.p2,
-                    start_time_s=start_s,
-                    end_time_s=end_s,
-                    level=ep.level,
-                    delta_level=ep.deltaLevel,
-                ))
-            if epochs:
-                return epochs
-        except AttributeError:
-            pass
-
-        # --- Fallback: sweepEpochs (always available, no deltaLevel) ---
-        try:
-            se = self._abf.sweepEpochs
-            epochs = []
-            for i, (p1, p2, level, ep_type) in enumerate(
-                zip(se.p1s, se.p2s, se.levels, se.types)
-            ):
-                epochs.append(EpochInfo(
-                    epoch_index=i,
-                    epoch_type=ep_type,
-                    start_sample=p1,
-                    end_sample=p2,
-                    start_time_s=p1 / self.sampling_rate_hz,
-                    end_time_s=p2 / self.sampling_rate_hz,
-                    level=float(level),
-                    delta_level=0.0,
-                ))
+            self._abf.setSweep(sweep_index)
+            epochs = self._epochs_from_waveform(self._abf.sweepEpochs)
             if epochs:
                 return epochs
         except AttributeError:
