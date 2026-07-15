@@ -10,3 +10,4 @@ build/
 *.h5
 .ipynb_checkpoints/
 test_*.py
+notebooks/
