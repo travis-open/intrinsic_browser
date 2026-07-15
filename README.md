@@ -101,6 +101,22 @@ cell.export_spike_table()
 cell.save_session()
 ```
 
+### Trace viewer (GUI)
+
+```bash
+python -m wholecell.gui.trace_viewer
+```
+
+Opens a directory picker if run with no arguments. You can also pass a path directly:
+
+```bash
+python -m wholecell.gui.trace_viewer path/to/recording.abf
+python -m wholecell.gui.trace_viewer path/to/directory
+python -m wholecell.gui.trace_viewer path/to/cell_session.json
+```
+
+Optional flags: `--cell-id`, `--lowpass <Hz>`, `--epoch <index>`.
+
 ---
 
 ## Output files
@@ -227,3 +243,7 @@ intrinsic_props/
     └── io/
         └── abf_reader.py       # ABF inspection and epoch utilities
 ```
+
+---
+
+*Built with [Claude Code](https://claude.com/claude-code).*
