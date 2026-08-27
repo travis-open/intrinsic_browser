@@ -1098,6 +1098,10 @@ class TraceViewer:
         if v_mean == v_mean:
             rows_txt.append(f"V_rest  mean ± SD : {v_mean:.2f} ± {v_std:.2f} mV")
 
+        v_init = cell_level.get("initial_voltage_mV", float("nan"))
+        if v_init == v_init:
+            rows_txt.append(f"Initial voltage   : {v_init:.2f} mV")
+
         self._results_box.setPlainText("\n".join(rows_txt))
         self._refresh_analysis_checks()
 

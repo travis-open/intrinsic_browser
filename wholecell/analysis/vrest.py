@@ -39,7 +39,10 @@ def run_vrest_analysis(
           ``filename``, ``sweep_index``, ``display_label``, and
           ``v_rest_mV`` (the mean voltage for that sweep's baseline window).
         - ``"cell_level"`` (dict): ``v_rest_mV`` (mean across sweeps),
-          ``v_rest_std_mV``, and ``n_sweeps_analyzed``.
+          ``v_rest_std_mV``, ``n_sweeps_analyzed``, and
+          ``initial_voltage_mV`` (mean voltage during the first epoch of the
+          first sweep; falls back to the full first sweep when it has no
+          epoch table).
     """
     per_sweep: list[dict] = []
 
@@ -62,6 +65,13 @@ def run_vrest_analysis(
     else:
         cell_level["v_rest_mV"] = float("nan")
         cell_level["v_rest_std_mV"] = float("nan")
+
+    if collection.sweeps:
+        cell_level["initial_voltage_mV"] = _initial_voltage(
+            collection, collection.sweeps[0], lowpass_hz
+        )
+    else:
+        cell_level["initial_voltage_mV"] = float("nan")
 
     return {
         "per_sweep": per_sweep,
@@ -90,6 +100,29 @@ def _has_current_injection(
         return any(abs(ep.level) > _INJECTION_THRESHOLD_PA for ep in epochs)
     except Exception:
         return False
+
+
+def _initial_voltage(
+    collection: SweepCollection,
+    ref: SweepRef,
+    lowpass_hz: float | None,
+) -> float:
+    """Return the mean voltage during the first epoch of ``ref``.
+
+    Uses epoch 0 (the pre-injection holding period). If the sweep has no
+    epoch table, falls back to averaging the full sweep.
+    """
+    try:
+        _, v, _ = collection.get_epoch_arrays(ref, 0, lowpass_hz=lowpass_hz)
+        valid = v[~np.isnan(v)]
+        if len(valid) > 0:
+            return float(np.mean(valid))
+    except Exception:
+        pass
+
+    _, v, _ = collection.get_sweep_arrays(ref, lowpass_hz=lowpass_hz)
+    valid = v[~np.isnan(v)]
+    return float(np.mean(valid)) if len(valid) > 0 else float("nan")
 
 
 def _baseline_voltage(
