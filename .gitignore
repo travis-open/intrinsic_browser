@@ -11,3 +11,5 @@ build/
 .ipynb_checkpoints/
 test_*.py
 notebooks/
+test_output/
+test_outputs/
