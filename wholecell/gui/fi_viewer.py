@@ -44,6 +44,8 @@ class FICurveViewer:
         self._slope_n = cell_level.get("fi_slope_n_points", 0)
         self._max_rate = cell_level.get("max_firing_rate_hz", float("nan"))
         self._max_peak_rate = cell_level.get("max_peak_instantaneous_rate_hz", float("nan"))
+        self._current_at_max_rate = cell_level.get("current_at_max_firing_pA", float("nan"))
+        self._dep_block_current = cell_level.get("dep_block_current_pA", float("nan"))
 
         app = QtWidgets.QApplication.instance()
         if app is None:
@@ -92,6 +94,7 @@ class FICurveViewer:
         self._info_box.setStyleSheet(
             "color: #aaf; font-size: 11px; font-family: monospace; padding: 2px;"
         )
+        self._info_box.setWordWrap(True)
         layout.addWidget(self._info_box)
 
         self._refresh_plot()
@@ -176,6 +179,10 @@ class FICurveViewer:
             parts.append(f"Max mean rate: {self._max_rate:.1f} Hz")
         if not math.isnan(self._max_peak_rate):
             parts.append(f"Max peak rate: {self._max_peak_rate:.1f} Hz")
+        if not math.isnan(self._current_at_max_rate):
+            parts.append(f"I @ max rate: {self._current_at_max_rate:.0f} pA")
+        if not math.isnan(self._dep_block_current):
+            parts.append(f"Dep. block: {self._dep_block_current:.0f} pA")
         if not math.isnan(self._slope):
             r2_str = f"  R²={self._r2:.3f}" if not math.isnan(self._r2) else ""
             parts.append(f"F-I slope: {self._slope:.4f} Hz/pA{r2_str} (n={self._slope_n})")

@@ -935,13 +935,22 @@ class TraceViewer:
         cell_level = fi_result.get("cell_level", {})
         rheobase = cell_level.get("rheobase_pA", float("nan"))
         max_rate = cell_level.get("max_firing_rate_hz", float("nan"))
+        max_peak_rate = cell_level.get("max_peak_instantaneous_rate_hz", float("nan"))
+        current_at_max_rate = cell_level.get("current_at_max_firing_pA", float("nan"))
+        dep_block_current = cell_level.get("dep_block_current_pA", float("nan"))
         slope = cell_level.get("fi_slope_hz_per_pA", float("nan"))
 
         msg_parts = []
         if rheobase == rheobase:  # not NaN
             msg_parts.append(f"Rheobase: {rheobase:.0f} pA")
         if max_rate == max_rate:
-            msg_parts.append(f"Max rate: {max_rate:.1f} Hz")
+            msg_parts.append(f"Max mean rate: {max_rate:.1f} Hz")
+        if max_peak_rate == max_peak_rate:
+            msg_parts.append(f"Max peak rate: {max_peak_rate:.1f} Hz")
+        if current_at_max_rate == current_at_max_rate:
+            msg_parts.append(f"I @ max rate: {current_at_max_rate:.0f} pA")
+        if dep_block_current == dep_block_current:
+            msg_parts.append(f"Dep. block: {dep_block_current:.0f} pA")
         if slope == slope:
             msg_parts.append(f"F-I slope: {slope:.4f} Hz/pA")
         self._results_box.setPlainText("\n".join(msg_parts) if msg_parts else "F-I analysis complete.")

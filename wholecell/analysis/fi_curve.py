@@ -14,7 +14,7 @@ Outputs
   instantaneous_rates_hz (list), first_isi_ms, last_isi_ms
 - Cell-level: rheobase_pA, fi_slope_hz_per_pA, fi_slope_r2,
   fi_slope_n_points, max_firing_rate_hz, max_peak_instantaneous_rate_hz,
-  n_steps_analyzed
+  current_at_max_firing_pA, dep_block_current_pA, n_steps_analyzed
 - fi_curve: parallel lists for plotting (current_pA, mean_rate_hz,
   peak_rate_hz, n_spikes)
 """
@@ -24,6 +24,13 @@ from __future__ import annotations
 import numpy as np
 
 from wholecell.core.sweep_collection import SweepCollection
+
+
+# Depolarization-block search — ports detect_depolarization_block_no_fit.
+# The threshold factor is the literal change_percent=2 from that function
+# (its stability condition is abs(count - min) <= factor * min).
+_DEP_BLOCK_CHANGE_FRAC = 2.0
+_DEP_BLOCK_LOOKAHEAD = 3  # sweeps
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +181,16 @@ def _compute_cell_level_fi(per_sweep: list[dict]) -> dict:
         default=float("nan"),
     )
 
+    # Current at the highest mean firing rate. per_sweep is sorted ascending by
+    # current, and max() returns the first maximal element, so ties resolve to
+    # the lower current.
+    current_at_max_firing_pA = float("nan")
+    if supra:
+        best = max(per_sweep, key=lambda r: r["mean_firing_rate_hz"])
+        current_at_max_firing_pA = float(best["current_injection_pA"])
+
+    dep_block_current_pA = _dep_block_current(per_sweep)
+
     fi_slope_hz_per_pA = float("nan")
     fi_slope_intercept_hz = float("nan")
     fi_slope_r2 = float("nan")
@@ -205,12 +222,67 @@ def _compute_cell_level_fi(per_sweep: list[dict]) -> dict:
         "rheobase_pA": rheobase_pA,
         "max_firing_rate_hz": float(max_rate) if not np.isnan(max_rate) else float("nan"),
         "max_peak_instantaneous_rate_hz": float(max_peak_inst),
+        "current_at_max_firing_pA": current_at_max_firing_pA,
+        "dep_block_current_pA": dep_block_current_pA,
         "fi_slope_hz_per_pA": fi_slope_hz_per_pA,
         "fi_slope_intercept_hz": fi_slope_intercept_hz,
         "fi_slope_r2": fi_slope_r2,
         "fi_slope_n_points": fi_slope_n_points,
         "n_steps_analyzed": n,
     }
+
+
+# ---------------------------------------------------------------------------
+# Depolarization block
+# ---------------------------------------------------------------------------
+
+def _dep_block_current(per_sweep: list[dict]) -> float:
+    """Current at the sweep where firing enters depolarization block.
+
+    Faithful port of the block search in ``detect_depolarization_block_no_fit``.
+    AP detection is unchanged; this operates only on the per-sweep in-epoch
+    spike counts (our equivalent of ``ap_counts_per_sweep``) and the
+    current-sorted per-sweep current list (our equivalent of ``current_steps``).
+
+    Two stages, mirroring the original:
+
+    1. ``max_ap_sweep_idx`` -- the first spiking sweep whose spike count is not
+       exceeded by any of the next ``_DEP_BLOCK_LOOKAHEAD`` sweeps (a firing
+       plateau); falls back to ``argmax`` of the spike counts.
+    2. ``block_sweep_idx`` -- searching above the plateau, the first run of
+       ``_DEP_BLOCK_LOOKAHEAD`` sweeps whose counts are all within
+       ``_DEP_BLOCK_CHANGE_FRAC`` times the minimum of the following
+       ``_DEP_BLOCK_LOOKAHEAD`` sweeps; falls back to the last sweep.
+
+    Returns the current at ``block_sweep_idx``, or NaN when ``per_sweep`` is empty.
+    """
+    if not per_sweep:
+        return float("nan")
+
+    counts = [r["n_spikes"] for r in per_sweep]
+    currents = [float(r["current_injection_pA"]) for r in per_sweep]
+    n = len(per_sweep)
+    w = _DEP_BLOCK_LOOKAHEAD
+
+    max_ap_sweep_idx = None
+    for s in range(1, n - w):
+        if counts[s] > 0 and all(counts[s + k] <= counts[s] for k in range(1, w + 1)):
+            max_ap_sweep_idx = s
+            break
+    if max_ap_sweep_idx is None:
+        max_ap_sweep_idx = int(np.argmax(counts))
+
+    block_sweep_idx = None
+    for s in range(max_ap_sweep_idx + 1, n - w):
+        next_min = min(counts[s + 1:s + 1 + w])
+        if all(abs(counts[i] - next_min) <= _DEP_BLOCK_CHANGE_FRAC * next_min
+               for i in range(s, s + w)):
+            block_sweep_idx = s
+            break
+    if block_sweep_idx is None:
+        block_sweep_idx = n - 1
+
+    return currents[block_sweep_idx]
 
 
 # ---------------------------------------------------------------------------
