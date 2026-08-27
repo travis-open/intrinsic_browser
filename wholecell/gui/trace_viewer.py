@@ -1074,9 +1074,15 @@ class TraceViewer:
         )
 
         lowpass = self._default_lowpass_hz if self._filter_on else None
+        dvdt_thresh = self._dvdt_spin.value()
+        peak_window = self._peak_window_spin.value()
 
         try:
-            result = run_vrest_analysis(col, lowpass_hz=lowpass)
+            result = run_vrest_analysis(
+                col, lowpass_hz=lowpass,
+                dvdt_detection_mVms=dvdt_thresh,
+                peak_search_window_ms=peak_window,
+            )
         except Exception as exc:
             self._results_box.setPlainText(f"V_rest analysis error:\n{exc}")
             return
@@ -1085,6 +1091,8 @@ class TraceViewer:
             "collection_name": self._current_collection.name,
             "lowpass_hz": lowpass,
             "n_sweeps": len(checked),
+            "dvdt_detection_mVms": dvdt_thresh,
+            "peak_search_window_ms": peak_window,
             "source": "vrest_analysis",
         })
 
@@ -1092,24 +1100,50 @@ class TraceViewer:
         cell_level = result.get("cell_level", {})
         filt_str = f"LP {lowpass:.0f} Hz" if lowpass else "raw"
 
-        hdr = f"{'Sw':>3}  {'V_rest (mV)':>11}"
+        def _fmt(x, spec=".2f"):
+            return format(x, spec) if isinstance(x, float) and x == x else "—"
+
+        hdr = f"{'Sw':>3}  {'V_rest':>8}  {'APs':>4}  {'meanISI(s)':>10}  {'ISI CV':>7}"
         sep = "─" * len(hdr)
-        rows_txt = [f"N={len(per_sweep)}  Filter={filt_str}", sep, hdr, sep]
+        rows_txt = [
+            f"N={len(per_sweep)}  Filter={filt_str}  "
+            f"dV/dt={dvdt_thresh:.0f} mV/ms  peak_win={peak_window:.0f} ms",
+            sep, hdr, sep,
+        ]
 
         for r in per_sweep:
-            v = r.get("v_rest_mV", float("nan"))
-            v_str = f"{v:.2f}" if v == v else "   NaN"
-            rows_txt.append(f"{r.get('sweep_index', '?'):>3}  {v_str:>11}")
+            n_aps = r.get("n_aps")
+            n_aps_str = str(n_aps) if n_aps is not None else "—"
+            rows_txt.append(
+                f"{r.get('sweep_index', '?'):>3}  {_fmt(r.get('v_rest_mV', float('nan'))):>8}  "
+                f"{n_aps_str:>4}  {_fmt(r.get('mean_isi_s', float('nan')), '.4f'):>10}  "
+                f"{_fmt(r.get('isi_cv', float('nan')), '.3f'):>7}"
+            )
 
         rows_txt.append(sep)
         v_mean = cell_level.get("v_rest_mV", float("nan"))
         v_std = cell_level.get("v_rest_std_mV", float("nan"))
         if v_mean == v_mean:
-            rows_txt.append(f"V_rest  mean ± SD : {v_mean:.2f} ± {v_std:.2f} mV")
+            rows_txt.append(f"V_rest  mean ± SD  : {v_mean:.2f} ± {v_std:.2f} mV")
 
         v_init = cell_level.get("initial_voltage_mV", float("nan"))
         if v_init == v_init:
-            rows_txt.append(f"Initial voltage   : {v_init:.2f} mV")
+            rows_txt.append(f"Initial voltage    : {v_init:.2f} mV")
+
+        ap_any = cell_level.get("ap_detected")
+        if ap_any is not None:
+            rows_txt.append(
+                f"AP detected (any)  : {'yes' if ap_any else 'no'}  "
+                f"(total {cell_level.get('n_aps_total', 0)})"
+            )
+            init_isi = cell_level.get("initial_mean_isi_s", float("nan"))
+            if isinstance(init_isi, float) and init_isi == init_isi:
+                rows_txt.append(
+                    f"Initial sweep ISI  : mean {init_isi:.4f} s, "
+                    f"CV {_fmt(cell_level.get('initial_isi_cv', float('nan')), '.3f')}"
+                )
+        elif cell_level.get("ap_detection_error"):
+            rows_txt.append(f"AP detection failed: {cell_level['ap_detection_error']}")
 
         self._results_box.setPlainText("\n".join(rows_txt))
         self._refresh_analysis_checks()

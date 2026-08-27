@@ -135,6 +135,10 @@ CELL_LEVEL_COLUMNS = [
     ("vrest__v_rest_mV", "vrest", "v_rest_mV"),
     ("vrest__v_rest_std_mV", "vrest", "v_rest_std_mV"),
     ("vrest__initial_voltage_mV", "vrest", "initial_voltage_mV"),
+    ("vrest__ap_detected", "vrest", "ap_detected"),
+    ("vrest__n_aps_total", "vrest", "n_aps_total"),
+    ("vrest__initial_mean_isi_s", "vrest", "initial_mean_isi_s"),
+    ("vrest__initial_isi_cv", "vrest", "initial_isi_cv"),
     ("sag_passive__mean_input_resistance_MOhm", "sag_passive", "mean_input_resistance_MOhm"),
     ("sag_passive__mean_time_constant_ms", "sag_passive", "mean_time_constant_ms"),
     ("sag_passive__mean_time_constant_r2", "sag_passive", "mean_time_constant_r2"),
@@ -458,7 +462,11 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
                 rec = cell.add_recording(p)
                 name = rec.filename
                 cell.create_sweep_collection(name, _all_sweeps(name, rec))
-                result = run_vrest_analysis(cell.collections[name], lowpass_hz=args.lowpass)
+                result = run_vrest_analysis(
+                    cell.collections[name], lowpass_hz=args.lowpass,
+                    dvdt_detection_mVms=args.dvdt,
+                    peak_search_window_ms=args.peak_window,
+                )
                 cell._store_result("v_rest", result, {
                     "collection_name": name, "source": "batch_intrinsic",
                 })

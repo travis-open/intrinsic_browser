@@ -777,9 +777,13 @@ class Cell:
         if self.results.get("ramp_evoked_APs"):
             summary["ramp_evoked_APs"] = self.results["ramp_evoked_APs"][-1]["data"]
 
-        # Resting potential section
+        # Resting potential section — flat cell_level scalars plus the
+        # per-sweep table (AP counts / ISI stats live only per sweep).
         if self.results.get("v_rest"):
-            summary["v_rest"] = self.results["v_rest"][-1]["data"]["cell_level"]
+            vr_data = self.results["v_rest"][-1]["data"]
+            vr_summary = dict(vr_data.get("cell_level", {}))
+            vr_summary["per_sweep"] = vr_data.get("per_sweep", [])
+            summary["v_rest"] = vr_summary
 
         if filepath is None:
             filepath = self.output_dir / f"{self.cell_id}_cell_summary.json"
