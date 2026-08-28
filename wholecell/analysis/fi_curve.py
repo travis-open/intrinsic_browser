@@ -11,7 +11,7 @@ Outputs
 ~~~~~~~
 - Per-sweep: current_injection_pA, epoch_duration_s, n_spikes,
   mean_firing_rate_hz, peak_instantaneous_rate_hz, mean_isi_ms, min_isi_ms,
-  instantaneous_rates_hz (list), first_isi_ms, last_isi_ms
+  spike_times_from_onset_ms (list), first_isi_ms, last_isi_ms
 - Cell-level: rheobase_pA, fi_slope_hz_per_pA, fi_slope_r2,
   fi_slope_n_points, max_firing_rate_hz, max_peak_instantaneous_rate_hz,
   current_at_max_firing_pA, dep_block_current_pA, n_steps_analyzed
@@ -115,7 +115,8 @@ def _build_sweep_row(
 
     rec = collection._recordings[ref.filename]
     epoch = rec.get_epoch(ref.sweep_index, epoch_index)
-    epoch_duration_s = epoch.end_time_s - epoch.start_time_s
+    epoch_start_s = epoch.start_time_s
+    epoch_duration_s = epoch.end_time_s - epoch_start_s
 
     # Filter to spikes in the stimulus epoch only
     epoch_spikes = [
@@ -126,9 +127,14 @@ def _build_sweep_row(
     spike_times = [sp["peak_time_s"] for sp in epoch_spikes]
     n_spikes = len(spike_times)
 
+    # Peak times referenced to current-step onset
+    spike_times_from_onset_ms = [
+        (t - epoch_start_s) * 1000.0 for t in spike_times
+    ]
+
     mean_rate_hz = (n_spikes / epoch_duration_s) if epoch_duration_s > 0 else 0.0
 
-    isis_ms, inst_rates_hz = _compute_isis(spike_times)
+    isis_ms = _compute_isis(spike_times)
 
     mean_isi_ms = float(np.mean(isis_ms)) if isis_ms else float("nan")
     min_isi_ms = float(np.min(isis_ms)) if isis_ms else float("nan")
@@ -145,7 +151,7 @@ def _build_sweep_row(
         "peak_instantaneous_rate_hz": peak_inst_rate_hz,
         "mean_isi_ms": mean_isi_ms,
         "min_isi_ms": min_isi_ms,
-        "instantaneous_rates_hz": inst_rates_hz,
+        "spike_times_from_onset_ms": spike_times_from_onset_ms,
         "first_isi_ms": float(isis_ms[0]) if isis_ms else float("nan"),
         "last_isi_ms": float(isis_ms[-1]) if isis_ms else float("nan"),
     }
@@ -289,24 +295,12 @@ def _dep_block_current(per_sweep: list[dict]) -> float:
 # ISI helpers
 # ---------------------------------------------------------------------------
 
-def _compute_isis(
-    spike_times_s: list[float],
-) -> tuple[list[float], list[float]]:
-    """Compute inter-spike intervals and instantaneous firing rates.
-
-    Returns
-    -------
-    isis_ms : list of float
-    instantaneous_rates_hz : list of float
-    """
+def _compute_isis(spike_times_s: list[float]) -> list[float]:
+    """Compute inter-spike intervals in milliseconds."""
     if len(spike_times_s) < 2:
-        return [], []
+        return []
 
-    isis_s = [
-        spike_times_s[i + 1] - spike_times_s[i]
+    return [
+        (spike_times_s[i + 1] - spike_times_s[i]) * 1000.0
         for i in range(len(spike_times_s) - 1)
     ]
-    isis_ms = [isi * 1000.0 for isi in isis_s]
-    rates_hz = [1.0 / isi for isi in isis_s if isi > 0]
-
-    return isis_ms, rates_hz
