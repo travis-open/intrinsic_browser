@@ -6,7 +6,7 @@ a spreadsheet, reproducing the trace_viewer GUI buttons for each protocol file.
 
 Per cell row, for every protocol column that names a single existing ABF file:
 
-    small_steps_file  ->  Find Spikes  +  F-I Curve
+    small_steps_file  ->  Find Spikes  +  F-I Curve  +  Analyze AHP
     free_run_file     ->  Measure V_rest
     ramp_file         ->  Find Spikes (same params)  +  Analyze Ramp APs
     sagIh_file        ->  Analyze Each Sweep (Passive)
@@ -159,6 +159,14 @@ CELL_LEVEL_COLUMNS = [
     ("ramp__mean_half_width_ms", "ramp", "mean_half_width_ms"),
     ("ramp__mean_current_at_threshold_pA", "ramp", "mean_current_at_threshold_pA"),
     ("ramp__n_sweeps_analyzed", "ramp", "n_sweeps_analyzed"),
+    ("ahp__mean_mahp_delta_mV", "ahp", "mean_mahp_delta_mV"),
+    ("ahp__max_mahp_delta_mV", "ahp", "max_mahp_delta_mV"),
+    ("ahp__current_at_max_mahp_pA", "ahp", "current_at_max_mahp_pA"),
+    ("ahp__mean_sahp_delta_mV", "ahp", "mean_sahp_delta_mV"),
+    ("ahp__max_sahp_delta_mV", "ahp", "max_sahp_delta_mV"),
+    ("ahp__current_at_max_sahp_pA", "ahp", "current_at_max_sahp_pA"),
+    ("ahp__n_sweeps_analyzed", "ahp", "n_sweeps_analyzed"),
+    ("ahp__any_window_truncated", "ahp", "any_window_truncated"),
 ]
 
 BATCH_SUMMARY_COLUMNS = IDENTITY_COLUMNS + [c[0] for c in CELL_LEVEL_COLUMNS]
@@ -220,6 +228,7 @@ def flatten_cell_level(summary: dict) -> dict:
         "sag_passive": summary.get("passive_range", {}) or {},
         "avg_passive": summary.get("passive_repeated_step", {}) or {},
         "ramp": summary.get("ramp_evoked_APs", {}).get("cell_level", {}) or {},
+        "ahp": summary.get("ahp", {}) or {},
     }
     out: dict = {}
     for col, section, key in CELL_LEVEL_COLUMNS:
@@ -388,6 +397,17 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
             except Exception as exc:
                 traceback.print_exc()
                 notes_by_protocol["small_steps"] = f"error: {exc}"
+
+            # AHP: same current-step collection / epoch as the F-I curve, no
+            # spike detection required (trace_viewer._run_ahp_analysis). Own
+            # try/except so an AHP failure doesn't undo the F-I result.
+            if "small_steps" in ran:
+                try:
+                    cell.analyze_ahp(name, epoch)  # GUI defaults: 2 kHz, 100/1000 ms
+                    ran.append("ahp")
+                except Exception as exc:
+                    traceback.print_exc()
+                    notes_by_protocol["ahp"] = f"error: {exc}"
 
     # ---- ramp: Find Spikes (same params) + Analyze Ramp APs ---------------
     if "ramp" in protocols:
