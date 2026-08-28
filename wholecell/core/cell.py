@@ -530,6 +530,76 @@ class Cell:
         else:
             viewer.show()
 
+    def analyze_ahp(
+        self,
+        collection_name: str,
+        epoch_index: int,
+        lowpass_hz: float | None = 2000.0,
+        mahp_window_ms: float = 100.0,
+        sahp_window_ms: float = 1000.0,
+    ) -> dict:
+        """Measure the AHP following each depolarizing current step.
+
+        Runs on the same current-step collection used for the F-I curve, but
+        does not require spike detection. Only depolarizing sweeps are
+        analysed; hyperpolarizing and zero steps are skipped.
+
+        Parameters
+        ----------
+        collection_name : str
+        epoch_index : int
+            Stimulus epoch. Its end is the current-off boundary; the epoch
+            before it supplies the baseline voltage.
+        lowpass_hz : float or None
+            Cutoff applied before searching for the voltage minima.
+        mahp_window_ms, sahp_window_ms : float
+            Search windows (ms) from current off. Both start at current off,
+            so the sAHP window contains the mAHP window.
+
+        Returns
+        -------
+        dict
+            Timestamped result dict with per-sweep AHP voltages, times and
+            deltas, plotting lists, and cell-level summaries. Also appended to
+            ``self.results["ahp"]``.
+        """
+        from wholecell.analysis.ahp import run_ahp_analysis
+        sc = self.get_collection(collection_name)
+        params = {
+            "collection_name": collection_name,
+            "epoch_index": epoch_index,
+            "lowpass_hz": lowpass_hz,
+            "mahp_window_ms": mahp_window_ms,
+            "sahp_window_ms": sahp_window_ms,
+        }
+        result = run_ahp_analysis(
+            sc, epoch_index,
+            lowpass_hz=lowpass_hz,
+            mahp_window_ms=mahp_window_ms,
+            sahp_window_ms=sahp_window_ms,
+        )
+        return self._store_result("ahp", result, params)
+
+    def plot_ahp(self, block: bool = False) -> None:
+        """Open the AHP viewer popup on the most recent AHP result.
+
+        Parameters
+        ----------
+        block : bool
+            If True, block until the window is closed. If False (default),
+            show non-blocking.
+        """
+        from wholecell.gui.ahp_viewer import AHPViewer
+        ahp_entry = self._get_latest_result("ahp")
+        viewer = AHPViewer(
+            ahp_result=ahp_entry["data"],
+            title=f"{self.cell_id} — AHP",
+        )
+        if block:
+            viewer.exec()
+        else:
+            viewer.show()
+
     def extract_spike_features(
         self,
         collection_name: str,
@@ -784,6 +854,14 @@ class Cell:
             vr_summary = dict(vr_data.get("cell_level", {}))
             vr_summary["per_sweep"] = vr_data.get("per_sweep", [])
             summary["v_rest"] = vr_summary
+
+        # AHP section — cell_level scalars plus the full per-sweep table, so
+        # the raw mAHP/sAHP voltages and times are preserved in the export.
+        if self.results.get("ahp"):
+            ahp_data = self.results["ahp"][-1]["data"]
+            ahp_summary = dict(ahp_data.get("cell_level", {}))
+            ahp_summary["per_sweep"] = ahp_data.get("per_sweep", [])
+            summary["ahp"] = ahp_summary
 
         if filepath is None:
             filepath = self.output_dir / f"{self.cell_id}_cell_summary.json"

@@ -110,6 +110,7 @@ class TraceViewer:
         self._show_current = False
         self._show_dvdt = False
         self._show_spikes = False
+        self._show_ahp = False
         self._solo_mode = False
         self._avg_active = False
         self._plot_capped = False
@@ -117,6 +118,7 @@ class TraceViewer:
         # Analysis state — keyed by (filename, sweep_index)
         self._spike_data: dict[tuple[str, int], list] = {}
         self._tau_lookup: dict[tuple[str, int], dict] = {}
+        self._ahp_data: dict[tuple[str, int], dict] = {}
         self._avg_tau_fit: dict | None = None
 
         # Per-position curve sets (position = index into current collection)
@@ -346,6 +348,20 @@ class TraceViewer:
         row_vrest.addWidget(self._chk_vrest)
         left_layout.addLayout(row_vrest)
 
+        btn_ahp = QtWidgets.QPushButton("Analyze AHP")
+        btn_ahp.setStyleSheet(
+            "font-size: 11px; padding: 4px; background: #4a2a3a; color: #f8c;"
+        )
+        btn_ahp.setToolTip(
+            "Measure mAHP / sAHP after each depolarizing step  (H = toggle markers)"
+        )
+        btn_ahp.clicked.connect(self._run_ahp_analysis)
+        self._chk_ahp = _make_status_checkbox("AHP analysis has been run for this cell")
+        row_ahp = QtWidgets.QHBoxLayout()
+        row_ahp.addWidget(btn_ahp, stretch=1)
+        row_ahp.addWidget(self._chk_ahp)
+        left_layout.addLayout(row_ahp)
+
         btn_clear = QtWidgets.QPushButton("Clear Plot")
         btn_clear.setStyleSheet("font-size: 11px; padding: 3px;")
         btn_clear.clicked.connect(self._clear_plot)
@@ -436,8 +452,17 @@ class TraceViewer:
             symbol="t",  symbolSize=11, symbolBrush="#0ff", **_sp)
         self._mk_downstroke = self._plot_d.plot(
             symbol="t1", symbolSize=11, symbolBrush="#f4f", **_sp)
+        # Post-step AHP minima (separate from the per-spike slow AHP above).
+        # Colours come from the AHP popup so its coloured radio labels key both
+        # windows; symbol shape is what separates these from the spike markers.
+        from wholecell.gui.ahp_viewer import MAHP_COLOR, SAHP_COLOR
+        self._mk_mahp = self._plot_v.plot(
+            symbol="x",  symbolSize=12, symbolBrush=MAHP_COLOR, **_sp)
+        self._mk_sahp = self._plot_v.plot(
+            symbol="+",  symbolSize=12, symbolBrush=SAHP_COLOR, **_sp)
         for mk in (self._mk_threshold, self._mk_peak, self._mk_trough,
-                   self._mk_slow_ahp, self._mk_upstroke, self._mk_downstroke):
+                   self._mk_slow_ahp, self._mk_upstroke, self._mk_downstroke,
+                   self._mk_mahp, self._mk_sahp):
             mk.setZValue(20)
 
         # Auto-create a default collection for every loaded recording
@@ -650,6 +675,9 @@ class TraceViewer:
         self._clear_avg_curves()
         self._spike_data = {}
         self._update_spike_markers()
+        self._ahp_data = {}
+        self._show_ahp = False
+        self._update_ahp_markers()
 
         self._cursor = 0
         self._populate_sweep_list()
@@ -727,6 +755,9 @@ class TraceViewer:
     def _clear_plot(self) -> None:
         self._check_none()
         self._clear_avg_curves()
+        self._ahp_data.clear()
+        self._show_ahp = False
+        self._update_ahp_markers()
         self._results_box.clear()
 
     def _clear_curves(self) -> None:
@@ -800,6 +831,7 @@ class TraceViewer:
             self._update_tau(pos, c)
 
         self._update_spike_markers()
+        self._update_ahp_markers()
         self._update_avg_tau()
         self._list.setCurrentRow(self._cursor)
         self._update_status()
@@ -1147,6 +1179,144 @@ class TraceViewer:
 
         self._results_box.setPlainText("\n".join(rows_txt))
         self._refresh_analysis_checks()
+
+    def _run_ahp_analysis(self) -> None:
+        from wholecell.core.sweep_collection import SweepCollection
+        from wholecell.analysis.ahp import run_ahp_analysis
+        from wholecell.gui.ahp_viewer import AHPViewer
+
+        if self._current_collection is None:
+            self._results_box.setPlainText("No active collection.")
+            return
+
+        checked = self._checked_sweeps()
+        if not checked:
+            self._results_box.setPlainText("No sweeps checked.")
+            return
+
+        refs = [self._ref_at(pos) for pos in checked]
+        col = SweepCollection(
+            name="_viewer_ahp_temp",
+            sweeps=refs,
+            recordings=self._cell.recordings,
+        )
+
+        epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
+        # Always filtered, regardless of the F display toggle — a single noise
+        # sample must not define the minimum.
+        lowpass = self._default_lowpass_hz
+
+        try:
+            result = run_ahp_analysis(col, epoch_idx, lowpass_hz=lowpass)
+        except Exception as exc:
+            self._results_box.setPlainText(f"AHP analysis error:\n{exc}")
+            return
+
+        self._cell._store_result("ahp", result, {
+            "collection_name": self._current_collection.name,
+            "epoch_index": epoch_idx,
+            "lowpass_hz": lowpass,
+            "n_sweeps": len(checked),
+            "source": "ahp_analysis",
+        })
+
+        per_sweep = result.get("per_sweep", [])
+        cell_level = result.get("cell_level", {})
+
+        self._ahp_data = {
+            (r["filename"], r["sweep_index"]): r for r in per_sweep
+        }
+        self._show_ahp = True
+        self._update_ahp_markers()
+
+        def _fmt(x, spec=".2f"):
+            return format(x, spec) if isinstance(x, float) and x == x else "—"
+
+        hdr = (
+            f"{'Sw':>3}  {'I(pA)':>6}  {'base':>7}  "
+            f"{'mAHPΔ':>7}  {'t(ms)':>6}  {'sAHPΔ':>7}  {'t(ms)':>7}"
+        )
+        sep = "─" * len(hdr)
+        rows_txt = [
+            f"N={len(per_sweep)} depolarizing  "
+            f"({cell_level.get('n_sweeps_skipped_nondepolarizing', 0)} skipped)  "
+            f"LP {lowpass:.0f} Hz  epoch {epoch_idx}",
+            sep, hdr, sep,
+        ]
+
+        for r in per_sweep:
+            rows_txt.append(
+                f"{r.get('sweep_index', '?'):>3}  "
+                f"{_fmt(r.get('step_current_delta_pA', float('nan')), '.0f'):>6}  "
+                f"{_fmt(r.get('baseline_voltage_mV', float('nan'))):>7}  "
+                f"{_fmt(r.get('mahp_delta_mV', float('nan'))):>7}  "
+                f"{_fmt(r.get('mahp_time_from_off_ms', float('nan')), '.1f'):>6}  "
+                f"{_fmt(r.get('sahp_delta_mV', float('nan'))):>7}  "
+                f"{_fmt(r.get('sahp_time_from_off_ms', float('nan')), '.1f'):>7}"
+            )
+
+        rows_txt.append(sep)
+        for key, label in (("mahp", "mAHP"), ("sahp", "sAHP")):
+            mean = cell_level.get(f"mean_{key}_delta_mV", float("nan"))
+            std = cell_level.get(f"std_{key}_delta_mV", float("nan"))
+            peak = cell_level.get(f"max_{key}_delta_mV", float("nan"))
+            peak_i = cell_level.get(f"current_at_max_{key}_pA", float("nan"))
+            if isinstance(mean, float) and mean == mean:
+                rows_txt.append(
+                    f"{label} Δ  mean ± SD : {mean:.2f} ± {std:.2f} mV"
+                )
+            if isinstance(peak, float) and peak == peak:
+                rows_txt.append(
+                    f"{label} Δ  max       : {peak:.2f} mV @ {peak_i:.0f} pA"
+                )
+
+        if cell_level.get("any_window_truncated"):
+            rows_txt.append(
+                "Note: search window truncated by sweep end on ≥1 sweep."
+            )
+
+        self._results_box.setPlainText("\n".join(rows_txt))
+        self._refresh_analysis_checks()
+
+        self._ahp_viewer = AHPViewer(
+            ahp_result=result,
+            title=f"{self._cell.cell_id} — AHP",
+        )
+        self._ahp_viewer.show()
+
+    def _update_ahp_markers(self) -> None:
+        if not (self._show_ahp and self._ahp_data):
+            for mk in (self._mk_mahp, self._mk_sahp):
+                mk.setData([], [])
+            return
+
+        if self._current_collection is None:
+            return
+
+        checked = (
+            {self._cursor} if self._solo_mode else set(self._checked_sweeps())
+        )
+        mahp_t, mahp_v = [], []
+        sahp_t, sahp_v = [], []
+
+        for pos in checked:
+            ref = self._ref_at(pos)
+            row = self._ahp_data.get((ref.filename, ref.sweep_index))
+            if not row:
+                continue
+
+            for prefix, times, volts in (
+                ("mahp", mahp_t, mahp_v),
+                ("sahp", sahp_t, sahp_v),
+            ):
+                t = row.get(f"{prefix}_time_s", float("nan"))
+                v = row.get(f"{prefix}_voltage_mV", float("nan"))
+                if t == t and v == v:  # both non-NaN
+                    times.append(t)
+                    volts.append(v)
+
+        self._mk_mahp.setData(mahp_t, mahp_v)
+        self._mk_sahp.setData(sahp_t, sahp_v)
 
     def _update_spike_markers(self) -> None:
         visible = self._show_spikes and bool(self._spike_data)
@@ -1524,6 +1694,7 @@ class TraceViewer:
         self._chk_avg.setChecked(bool(self._cell.results.get("passive_repeated_step")))
         self._chk_passive.setChecked(bool(self._cell.results.get("passive_range")))
         self._chk_vrest.setChecked(bool(self._cell.results.get("v_rest")))
+        self._chk_ahp.setChecked(bool(self._cell.results.get("ahp")))
 
     # ------------------------------------------------------------------
     # Axis label helpers
@@ -1680,6 +1851,8 @@ class TraceViewer:
         self._current_collection = None
         self._cursor = 0
         self._spike_data.clear()
+        self._ahp_data.clear()
+        self._show_ahp = False
         self._curves.clear()
 
         self._cell_id_edit.setText(cell.cell_id)
@@ -1885,8 +2058,11 @@ class TraceViewer:
         self._clear_avg_curves()
         self._spike_data.clear()
         self._tau_lookup.clear()
+        self._ahp_data.clear()
+        self._show_ahp = False
         self._avg_tau_fit = None
         self._update_spike_markers()   # clears marker scatter plots
+        self._update_ahp_markers()
         self._list.clear()
         self._results_box.clear()
         self._cell_id_edit.setText(self._cell.cell_id)
@@ -2136,6 +2312,9 @@ class TraceViewer:
             self._full_update()
         elif key == QtCore.Qt.Key.Key_S:
             self._show_spikes = not self._show_spikes
+            self._full_update()
+        elif key == QtCore.Qt.Key.Key_H:
+            self._show_ahp = not self._show_ahp
             self._full_update()
         elif key == QtCore.Qt.Key.Key_V:
             self._toggle_solo()
