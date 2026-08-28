@@ -13,7 +13,9 @@ Per cell row, for every protocol column that names a single existing ABF file:
     hyperpol_file     ->  Average & Analyze Subthreshold
 
 Outputs (into --output-dir, default <repo>/test_outputs):
-    <cell_id>_spikes.csv         detection-only spike table for small_steps (GUI-faithful)
+    <cell_id>_spikes_<protocol>.csv  per-spike table (GUI-faithful), one per
+                                     protocol that ran Find Spikes:
+                                     small_steps, ramp, free_run
     <cell_id>_cell_summary.json  Cell.export_cell_summary — all analysis sections
     batch_summary.csv            one row per cell: status + curated cell-level features
 
@@ -72,6 +74,7 @@ from wholecell.core.cell import Cell
 from wholecell.io.abf_reader import find_step_epoch
 from wholecell.analysis.vrest import run_vrest_analysis
 from wholecell.analysis.ramp import run_ramp_analysis
+from wholecell.analysis.spikes.features import spike_table_dataframe
 from wholecell.analysis.passive import (
     estimate_input_resistance,
     fit_time_constant,
@@ -90,27 +93,6 @@ PROTOCOL_COLUMN = {
     "free_run": "free_run_file",
 }
 ALL_PROTOCOLS = list(PROTOCOL_COLUMN)
-
-# Column order of the GUI spike-table export (trace_viewer._on_export_spike_table),
-# i.e. run_spike_detection per-spike dicts minus "display_label".
-SPIKE_TABLE_COLUMNS = [
-    "filename",
-    "sweep_index",
-    "spike_index_in_sweep",
-    "peak_time_s",
-    "peak_voltage_mV",
-    "threshold_time_s",
-    "threshold_voltage_mV",
-    "trough_time_s",
-    "trough_voltage_mV",
-    "backend",
-    "current_at_threshold_pA",
-    "slow_ahp_voltage_mV",
-    "slow_ahp_time_s",
-    "epoch_at_threshold",
-    "latency_to_epoch_onset_ms",
-    "sweep_current_injection_pA",
-]
 
 IDENTITY_COLUMNS = [
     "cell_id",
@@ -198,26 +180,16 @@ def _all_sweeps(name: str, rec) -> list[dict]:
 
 
 def build_spike_table(spike_result_data: dict) -> pd.DataFrame:
-    """Replicate trace_viewer._on_export_spike_table against a stored result.
+    """Flatten a stored detection result into the shared spike-table schema.
 
     ``spike_result_data`` is a ``cell.results["spikes"][k]["data"]`` dict.
+    Column order comes from ``spike_table_dataframe``, the same helper the GUI
+    export uses, so both write identical CSVs.
     """
     rows: list[dict] = []
     for sweep in spike_result_data.get("per_sweep", []):
         rows.extend(sweep.get("spikes", []))
-
-    if not rows:
-        return pd.DataFrame(columns=SPIKE_TABLE_COLUMNS)
-
-    df = (
-        pd.DataFrame(rows)
-        .drop(columns=["display_label"], errors="ignore")
-        .sort_values(["filename", "sweep_index", "spike_index_in_sweep"])
-        .reset_index(drop=True)
-    )
-    ordered = [c for c in SPIKE_TABLE_COLUMNS if c in df.columns]
-    extra = [c for c in df.columns if c not in SPIKE_TABLE_COLUMNS]
-    return df[ordered + extra]
+    return spike_table_dataframe(rows)
 
 
 def flatten_cell_level(summary: dict) -> dict:
@@ -372,7 +344,8 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
     cell = Cell(cell_id=cell_id, output_dir=out_dir, notes=notes)
     ran: list[str] = []
     notes_by_protocol: dict[str, str] = {}
-    small_steps_spike_data: dict | None = None
+    # protocol -> its run_spike_detection result data, one spike CSV each
+    spike_data_by_protocol: dict[str, dict] = {}
 
     # ---- small_steps: Find Spikes + F-I Curve -----------------------------
     # Runs first: its spike result must be captured before ramp detection
@@ -389,7 +362,7 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
                 cell.create_sweep_collection(name, _all_sweeps(name, rec))
                 cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
                                  peak_search_window_ms=args.peak_window, lowpass_hz=args.lowpass)
-                small_steps_spike_data = cell.results["spikes"][-1]["data"]
+                spike_data_by_protocol["small_steps"] = cell.results["spikes"][-1]["data"]
                 cell.analyze_fi_curve(name, epoch)
                 status_row["n_sweeps"] = rec.n_sweeps
                 status_row["epoch_index"] = epoch
@@ -423,6 +396,7 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
                 cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
                                  peak_search_window_ms=args.peak_window,
                                  lowpass_hz=args.lowpass)
+                spike_data_by_protocol["ramp"] = cell.results["spikes"][-1]["data"]
                 result = run_ramp_analysis(
                     cell.collections[name], epoch, cell.results["spikes"][-1],
                     lowpass_hz=args.lowpass,
@@ -490,6 +464,8 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
                     dvdt_detection_mVms=args.dvdt,
                     peak_search_window_ms=args.peak_window,
                 )
+                if result.get("spike_detection") is not None:
+                    spike_data_by_protocol["free_run"] = result["spike_detection"]
                 cell._store_result("v_rest", result, {
                     "collection_name": name, "source": "batch_intrinsic",
                 })
@@ -499,12 +475,19 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
                 notes_by_protocol["free_run"] = f"error: {exc}"
 
     # ---- exports -------------------------------------------------------
-    if small_steps_spike_data is not None:
-        spike_df = build_spike_table(small_steps_spike_data)
-        spikes_csv = out_dir / f"{cell_id}_spikes.csv"
+    # One spike table per protocol that ran Find Spikes. n_spikes_total keeps
+    # its established meaning (small_steps count) so batch_summary.csv stays
+    # comparable with earlier runs.
+    written_csvs: list[str] = []
+    for protocol, spike_data in spike_data_by_protocol.items():
+        spike_df = build_spike_table(spike_data)
+        spikes_csv = out_dir / f"{cell_id}_spikes_{protocol}.csv"
         spike_df.to_csv(spikes_csv, index=False)
-        status_row["n_spikes_total"] = len(spike_df)
-        status_row["spikes_csv"] = str(spikes_csv)
+        written_csvs.append(str(spikes_csv))
+        if protocol == "small_steps":
+            status_row["n_spikes_total"] = len(spike_df)
+    if written_csvs:
+        status_row["spikes_csv"] = ";".join(written_csvs)
 
     summary_json = out_dir / f"{cell_id}_cell_summary.json"
     summary = cell.export_cell_summary(filepath=summary_json)

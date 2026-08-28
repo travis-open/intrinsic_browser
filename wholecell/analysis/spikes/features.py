@@ -1,15 +1,19 @@
 """
 features.py
 -----------
-Per-spike feature extraction: threshold voltage, peak, trough, half-width,
-AHP depth, and adaptation metrics.
+Per-spike shape measurements: height, half-width, AHP depth, rise/decay times,
+and up/downstroke velocities, plus cell-level summaries built from them.
 
-These features are computed from the raw (or lightly filtered) voltage trace
-around each detected spike. They are distinct from detection — detection
-finds spikes, this module measures their shapes.
+The per-spike measurements are computed at detection time — ``finder.py`` calls
+``extract_single_spike_features`` for every spike it finds, so every spike dict
+in a ``run_spike_detection`` result already carries the fields listed in
+``SPIKE_SHAPE_FIELDS``. This module therefore does the measuring but not the
+iterating; ``run_feature_extraction`` only assembles what the finder produced.
 
-The output of run_feature_extraction feeds:
-  - Cell.export_spike_table() → CSV with filename, sweep_index, and features
+The output feeds:
+  - Every exported spike table (GUI Export > Spike Table, batch_intrinsic)
+    via ``spike_table_dataframe``
+  - ``run_ramp_analysis`` first-AP features
   - GUI spike shape overlay (threshold, peak, and trough markers on traces)
   - Phase plane plots (dV/dt vs V)
 """
@@ -19,8 +23,44 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 
 from wholecell.core.sweep_collection import SweepCollection, SweepRef
+
+
+# Shape features measured for every detected spike. Single source of truth for
+# these column names — finder.py, ramp.py and the export helpers all read it.
+SPIKE_SHAPE_FIELDS = (
+    "height_mV",
+    "half_width_ms",
+    "ahp_depth_mV",
+    "rise_time_ms",
+    "decay_time_ms",
+    "upstroke_mVms",
+    "downstroke_mVms",
+)
+
+# Column order for every exported spike table. Detection fields first (in the
+# order finder.py builds them), then the shape features.
+SPIKE_TABLE_COLUMNS = [
+    "filename",
+    "sweep_index",
+    "spike_index_in_sweep",
+    "peak_time_s",
+    "peak_voltage_mV",
+    "threshold_time_s",
+    "threshold_voltage_mV",
+    "trough_time_s",
+    "trough_voltage_mV",
+    "backend",
+    "current_at_threshold_pA",
+    "slow_ahp_voltage_mV",
+    "slow_ahp_time_s",
+    "epoch_at_threshold",
+    "latency_to_epoch_onset_ms",
+    "sweep_current_injection_pA",
+    *SPIKE_SHAPE_FIELDS,
+]
 
 
 # Columns excluded from auto-collect when building first_spike_* cell features.
@@ -36,6 +76,105 @@ _SPIKE_IDENTITY_COLUMNS = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Spike table assembly / export
+# ---------------------------------------------------------------------------
+
+def spike_table_dataframe(rows: list[dict]) -> pd.DataFrame:
+    """Build the canonical spike-table DataFrame from per-spike dicts.
+
+    Shared by the GUI export (``trace_viewer._on_export_spike_table``) and the
+    batch script so both write identical columns in identical order.
+
+    ``display_label`` is dropped (it duplicates filename/sweep_index), rows are
+    sorted by sweep then spike order, and columns are reindexed to
+    ``SPIKE_TABLE_COLUMNS``. Any column not listed there is appended at the end
+    rather than dropped, so a new finder field still exports.
+
+    Parameters
+    ----------
+    rows : list of dict
+        Per-spike dicts, e.g. the concatenation of every
+        ``result["per_sweep"][i]["spikes"]``.
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    if not rows:
+        return pd.DataFrame(columns=SPIKE_TABLE_COLUMNS)
+
+    df = (
+        pd.DataFrame(rows)
+        .drop(columns=["display_label"], errors="ignore")
+        .sort_values(["filename", "sweep_index", "spike_index_in_sweep"])
+        .reset_index(drop=True)
+    )
+    ordered = [c for c in SPIKE_TABLE_COLUMNS if c in df.columns]
+    extra = [c for c in df.columns if c not in SPIKE_TABLE_COLUMNS]
+    return df[ordered + extra]
+
+
+def ensure_shape_features(
+    collection: SweepCollection,
+    sweep_data: dict,
+    lowpass_hz: float | None = None,
+) -> list[dict]:
+    """Return one sweep's spike dicts, backfilling shape features if absent.
+
+    Spike dicts from the current finder already carry every field in
+    ``SPIKE_SHAPE_FIELDS``. Results loaded from a session JSON saved before
+    those were added do not, so they are measured here from the trace. The
+    common case (nothing missing) returns the input list untouched and reads
+    no data.
+
+    Parameters
+    ----------
+    collection : SweepCollection
+        Must contain the sweep referenced by ``sweep_data``. If the sweep
+        cannot be read, the spikes are returned unmodified.
+    sweep_data : dict
+        One entry of a ``run_spike_detection`` result's ``"per_sweep"`` list.
+    lowpass_hz : float or None
+        Applied only on the backfill path.
+
+    Returns
+    -------
+    list of dict
+    """
+    spikes = sweep_data.get("spikes", [])
+    if all(f in sp for sp in spikes for f in SPIKE_SHAPE_FIELDS):
+        return spikes
+
+    ref = SweepRef(
+        filename=sweep_data["filename"],
+        sweep_index=sweep_data["sweep_index"],
+        display_label=sweep_data.get("display_label", ""),
+    )
+    try:
+        time, voltage, _ = collection.get_sweep_arrays(ref, lowpass_hz=lowpass_hz)
+    except Exception:
+        return spikes
+
+    dvdt_mVms = np.gradient(voltage, time) / 1000.0
+
+    out: list[dict] = []
+    for sp in spikes:
+        if all(f in sp for f in SPIKE_SHAPE_FIELDS):
+            out.append(sp)
+            continue
+        features = extract_single_spike_features(
+            time=time,
+            voltage=voltage,
+            peak_index=_time_to_index(time, sp["peak_time_s"]),
+            threshold_index=_time_to_index(time, sp["threshold_time_s"]),
+            trough_index=_time_to_index(time, sp["trough_time_s"]),
+            dvdt_mVms=dvdt_mVms,
+        )
+        out.append({**sp, **features})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public entry point (called by Cell.extract_spike_features)
 # ---------------------------------------------------------------------------
 
@@ -45,7 +184,10 @@ def run_feature_extraction(
     lowpass_hz: float | None = None,
     stimulus_epoch_index: int | None = None,
 ) -> dict:
-    """Extract per-spike features for all spikes in a detection result.
+    """Assemble the per-spike feature table for a detection result.
+
+    Shape features are measured by ``finder.py`` at detection time, so this is
+    a flatten-and-summarise pass rather than a second measurement pass.
 
     Parameters
     ----------
@@ -54,7 +196,8 @@ def run_feature_extraction(
         Output of ``run_spike_detection`` (the ``"data"`` field of the
         timestamped result stored on Cell).
     lowpass_hz : float or None
-        Lowpass filter applied to voltage before feature extraction.
+        Only used to backfill spike results saved before shape features were
+        computed at detection time (see ``ensure_shape_features``).
     stimulus_epoch_index : int or None
         If provided, cell-level summary features (rheobase, first-AP
         features, adaptation index) are computed only from spikes in this
@@ -66,9 +209,7 @@ def run_feature_extraction(
     dict with keys:
         - ``"spike_table"`` (list of dict): one dict per spike, suitable for
           pd.DataFrame construction. All spikes are included (no epoch
-          filtering). Columns include all detection carry-overs, extracted
-          shape features, plus ``epoch_at_threshold`` and
-          ``latency_to_epoch_onset_ms`` from the finder step.
+          filtering). Columns are ``SPIKE_TABLE_COLUMNS``.
 
         - ``"cell_level"`` (dict): across-cell summary scalars including
           ``first_spike_*`` fields auto-collected from all numeric spike-table
@@ -78,23 +219,9 @@ def run_feature_extraction(
     spike_table: list[dict] = []
 
     for sweep_data in spike_result["data"]["per_sweep"]:
-        ref = SweepRef(
-            filename=sweep_data["filename"],
-            sweep_index=sweep_data["sweep_index"],
-            display_label=sweep_data["display_label"],
+        spike_table.extend(
+            ensure_shape_features(collection, sweep_data, lowpass_hz)
         )
-        time, voltage, _ = collection.get_sweep_arrays(ref, lowpass_hz=lowpass_hz)
-
-        for spike_dict in sweep_data["spikes"]:
-            features = extract_single_spike_features(
-                time=time,
-                voltage=voltage,
-                peak_index=_time_to_index(time, spike_dict["peak_time_s"]),
-                threshold_index=_time_to_index(time, spike_dict["threshold_time_s"]),
-                trough_index=_time_to_index(time, spike_dict["trough_time_s"]),
-            )
-            row = {**spike_dict, **features}
-            spike_table.append(row)
 
     cell_level = _compute_cell_level_features(
         spike_table, stimulus_epoch_index=stimulus_epoch_index
@@ -118,6 +245,7 @@ def extract_single_spike_features(
     trough_index: int,
     upstroke_search_window_ms: float = 2.0,
     downstroke_search_window_ms: float = 5.0,
+    dvdt_mVms: np.ndarray | None = None,
 ) -> dict:
     """Compute shape features for one action potential.
 
@@ -137,24 +265,24 @@ def extract_single_spike_features(
         Window around the upstroke to search for max dV/dt (ms). Default 2.
     downstroke_search_window_ms : float
         Window around the downstroke to search for min dV/dt (ms). Default 5.
+    dvdt_mVms : np.ndarray or None
+        Precomputed dV/dt (mV/ms) for the whole sweep. Computing it here costs
+        a full-sweep pass per spike, so callers measuring many spikes in one
+        sweep should compute it once and pass it in. Defaults to computing it
+        from ``voltage`` and ``time``.
 
     Returns
     -------
     dict with keys: ``height_mV``, ``half_width_ms``, ``ahp_depth_mV``,
     ``rise_time_ms``, ``decay_time_ms``, ``upstroke_mVms``,
-    ``downstroke_mVms``.
+    ``downstroke_mVms`` — i.e. ``SPIKE_SHAPE_FIELDS``.
 
     Notes
     -----
     All features return NaN if computation fails (e.g. index out of bounds,
     division by zero). This is intentional — bad sweeps should not crash
     the pipeline.
-
-    TODO: implement each feature.
     """
-    dt_s = time[1] - time[0] if len(time) > 1 else 1e-5
-    sampling_rate_hz = 1.0 / dt_s
-
     peak_v = voltage[peak_index]
     threshold_v = voltage[threshold_index]
     trough_v = voltage[trough_index]
@@ -169,7 +297,8 @@ def extract_single_spike_features(
         time, voltage, threshold_index, peak_index, trough_index, threshold_v, peak_v
     )
 
-    dvdt_mVms = np.gradient(voltage, time) / 1000.0
+    if dvdt_mVms is None:
+        dvdt_mVms = np.gradient(voltage, time) / 1000.0
     upstroke_mVms = _max_dvdt_in_window(
         dvdt_mVms, threshold_index, peak_index
     )
@@ -189,7 +318,7 @@ def extract_single_spike_features(
 
 
 # ---------------------------------------------------------------------------
-# Feature helpers (stubs)
+# Feature helpers
 # ---------------------------------------------------------------------------
 
 def _estimate_half_width(

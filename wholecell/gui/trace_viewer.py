@@ -2214,9 +2214,9 @@ class TraceViewer:
             self._results_box.setPlainText(f"Save failed:\n{exc}")
 
     def _on_export_spike_table(self) -> None:
-        import pandas as pd
         from datetime import datetime
         from pyqtgraph.Qt import QtWidgets
+        from wholecell.analysis.spikes.features import spike_table_dataframe
 
         if not self._spike_data:
             QtWidgets.QMessageBox.information(
@@ -2235,12 +2235,7 @@ class TraceViewer:
             )
             return
 
-        df = (
-            pd.DataFrame(rows)
-            .drop(columns=["display_label"], errors="ignore")
-            .sort_values(["filename", "sweep_index", "spike_index_in_sweep"])
-            .reset_index(drop=True)
-        )
+        df = spike_table_dataframe(rows)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         suggested = str(

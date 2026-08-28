@@ -20,6 +20,7 @@ import numpy as np
 
 from wholecell.core.sweep_collection import SweepCollection, SweepRef
 from wholecell.analysis.spikes.base import build_spike_finder, SpikeDetection
+from wholecell.analysis.spikes.features import extract_single_spike_features
 from wholecell.filters.lowpass import apply_lowpass
 
 _DETECTION_LOWPASS_HZ = 2000.0
@@ -79,7 +80,15 @@ def run_spike_detection(
                 ``sweep_current_injection_pA`` (float),
                 ``current_at_threshold_pA`` (float),
                 ``slow_ahp_voltage_mV`` (float),
-                ``slow_ahp_time_s`` (float)
+                ``slow_ahp_time_s`` (float),
+              and the shape features in
+              ``wholecell.analysis.spikes.features.SPIKE_SHAPE_FIELDS``:
+                ``height_mV``, ``half_width_ms``, ``ahp_depth_mV``,
+                ``rise_time_ms``, ``decay_time_ms``, ``upstroke_mVms``,
+                ``downstroke_mVms``.
+              Note ``ahp_depth_mV`` (threshold minus the fast trough) is a
+              different measurement from ``slow_ahp_voltage_mV`` (the minimum
+              between this spike and the next).
 
     Raises
     ------
@@ -177,6 +186,22 @@ def _detect_in_sweep(
     for sd, sp in zip(spike_dicts, all_spikes):
         idx = min(sp.threshold_index, len(current) - 1)
         sd["current_at_threshold_pA"] = float(current[idx])
+
+    # Shape features for every spike, measured on voltage_raw so that
+    # height_mV / ahp_depth_mV stay exactly consistent with the peak,
+    # threshold and trough voltages refined above. dV/dt is computed once for
+    # the sweep rather than once per spike — sweeps with hundreds of APs
+    # (free-run recordings) would otherwise pay a full-sweep pass each time.
+    dvdt_mVms = np.gradient(voltage_raw, time) / 1000.0
+    for sd, sp in zip(spike_dicts, all_spikes):
+        sd.update(extract_single_spike_features(
+            time=time,
+            voltage=voltage_raw,
+            peak_index=sp.peak_index,
+            threshold_index=sp.threshold_index,
+            trough_index=sp.trough_index,
+            dvdt_mVms=dvdt_mVms,
+        ))
 
     # Slow AHP: minimum voltage between each spike's trough and the next
     # spike's threshold (or the reference epoch end for the last spike).

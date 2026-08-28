@@ -127,7 +127,7 @@ For each cell, analysis produces the following files in the specified `output_di
 |------|----------|
 | `{cell_id}_session.json` | Full session: loaded files, sweep selections, all results with timestamps, audit log of every analysis decision |
 | `{cell_id}_spikes_{timestamp}.csv` | Per-spike table with `filename`, `sweep_index`, and all shape features |
-| `{cell_id}_sweeps_{timestamp}.csv` | Per-sweep summary: spike count, firing rate, current injection amplitude |
+| `{cell_id}_sweep_summary_{timestamp}.csv` | Per-sweep summary: spike count, firing rate, current injection amplitude |
 | `{cell_id}_cell_summary.json` | Cell-level scalars (Rin, rheobase, first spike threshold) and full F-I curve |
 
 `filename` and `sweep_index` are always saved as separate columns so that any sweep can be reloaded directly:

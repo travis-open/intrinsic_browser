@@ -69,11 +69,16 @@ def run_vrest_analysis(
           ``detect_aps`` — ``ap_detected`` (True if any sweep had >= 1 AP),
           ``n_aps_total`` (summed over sweeps), ``initial_mean_isi_s`` and
           ``initial_isi_cv`` (the first sweep's ``mean_isi_s`` / ``isi_cv``).
+        - ``"spike_detection"`` (dict or None): the full ``run_spike_detection``
+          result behind those AP counts, so callers can export a free-run spike
+          table without a second detection pass. ``None`` when ``detect_aps``
+          is False or detection failed.
     """
     ap_map: dict | None = None
     ap_error: str | None = None
+    spike_detection: dict | None = None
     if detect_aps and collection.sweeps:
-        ap_map, ap_error = _detect_sweep_aps(
+        ap_map, ap_error, spike_detection = _detect_sweep_aps(
             collection, dvdt_detection_mVms, peak_search_window_ms
         )
 
@@ -118,6 +123,11 @@ def run_vrest_analysis(
     return {
         "per_sweep": per_sweep,
         "cell_level": cell_level,
+        # Full detection result, so callers can export a free-run spike table
+        # without paying for a second detection pass. None when detection was
+        # skipped or failed. Cell.export_cell_summary copies only "cell_level"
+        # and "per_sweep", so this does not reach the summary JSON.
+        "spike_detection": spike_detection,
     }
 
 
@@ -136,7 +146,7 @@ def _detect_sweep_aps(
     collection: SweepCollection,
     dvdt_detection_mVms: float,
     peak_search_window_ms: float,
-) -> tuple[dict | None, str | None]:
+) -> tuple[dict | None, str | None, dict | None]:
     """Detect APs across the full length of every sweep.
 
     Reuses ``run_spike_detection`` (the "Find Spikes" path). ``epoch_index=0``
@@ -146,10 +156,11 @@ def _detect_sweep_aps(
 
     Returns
     -------
-    (ap_map, error)
+    (ap_map, error, result)
         ``ap_map`` maps ``(filename, sweep_index)`` to a list of spike peak
         times (s), or ``None`` if detection failed. ``error`` is the failure
-        message (or ``None``).
+        message (or ``None``). ``result`` is the full detection result — every
+        per-spike dict, shape features included — or ``None`` on failure.
     """
     from wholecell.analysis.spikes.finder import run_spike_detection
 
@@ -162,14 +173,14 @@ def _detect_sweep_aps(
             peak_search_window_ms=peak_search_window_ms,
         )
     except Exception as exc:  # noqa: BLE001 — degrade gracefully, report reason
-        return None, f"{type(exc).__name__}: {exc}"
+        return None, f"{type(exc).__name__}: {exc}", None
 
     ap_map = {
         (sw["filename"], sw["sweep_index"]):
             [s["peak_time_s"] for s in sw.get("spikes", [])]
         for sw in result.get("per_sweep", [])
     }
-    return ap_map, None
+    return ap_map, None, result
 
 
 def _ap_metrics(peak_times: list[float] | None) -> dict:

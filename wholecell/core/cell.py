@@ -671,14 +671,17 @@ class Cell:
         Returns
         -------
         pd.DataFrame
-            The spike table with columns: filename, sweep_index,
-            spike_index_in_sweep, and all spike features.
+            The spike table in the shared export schema
+            (``features.SPIKE_TABLE_COLUMNS``) — the same columns the GUI
+            Export ▸ Spike Table and the batch script write.
         """
-        result = self._get_latest_result("spike_features")
-        df = pd.DataFrame(result["spike_table"])
+        from wholecell.analysis.spikes.features import spike_table_dataframe
+
+        entry = self._get_latest_result("spike_features")
+        df = spike_table_dataframe(entry["data"]["spike_table"])
 
         if filepath is None:
-            ts = result["timestamp"].replace(":", "").replace("-", "").replace(" ", "_")
+            ts = entry["timestamp"].replace(":", "").replace("-", "").replace(" ", "_")
             filepath = self.output_dir / f"{self.cell_id}_spikes_{ts}.csv"
 
         df.to_csv(filepath, index=False)

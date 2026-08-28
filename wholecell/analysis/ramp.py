@@ -7,18 +7,24 @@ Workflow:
   1. User runs "Find Spikes" on ramp sweeps (existing button).
   2. User clicks "Analyze Ramp APs" — this module is called.
   3. For each sweep, the first spike in the ramp epoch is identified and its
-     shape features are extracted using the same machinery as spike_features.
+     measurements are read off the detection result.
   4. Features are averaged across sweeps and saved as ramp_evoked_APs.
+
+Shape features (half-width, height, ...) are measured for every spike at
+detection time by ``finder.py``, so this module carries them rather than
+re-measuring the first AP. That keeps the ramp numbers identical to the ones
+in the exported spike table, and keeps ``height_mV`` consistent with the
+``peak_voltage_mV``/``threshold_voltage_mV`` carried alongside it.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from wholecell.core.sweep_collection import SweepCollection, SweepRef
+from wholecell.core.sweep_collection import SweepCollection
 from wholecell.analysis.spikes.features import (
-    extract_single_spike_features,
-    _time_to_index,
+    SPIKE_SHAPE_FIELDS,
+    ensure_shape_features,
 )
 
 # Fields carried directly from the spike detection dict (no re-computation).
@@ -30,6 +36,7 @@ _CARRY_FIELDS = (
     "latency_to_epoch_onset_ms",
     "slow_ahp_voltage_mV",
     "slow_ahp_time_s",
+    *SPIKE_SHAPE_FIELDS,
 )
 
 # Identity/metadata fields excluded from mean/std aggregation.
@@ -37,6 +44,9 @@ _IDENTITY_FIELDS = frozenset({
     "filename",
     "sweep_index",
     "display_label",
+    "backend",
+    "spike_index_in_sweep",
+    "epoch_at_threshold",
 })
 
 
@@ -60,7 +70,10 @@ def run_ramp_analysis(
         Full timestamped entry from ``cell.results["spikes"][-1]``
         (i.e. the dict with "timestamp", "params", "data" keys).
     lowpass_hz : float or None
-        Optional lowpass filter applied to voltage before feature extraction.
+        Only used when the spike result predates detection-time shape
+        features and they have to be backfilled from the trace. Shape features
+        from a current detection run are measured on the raw voltage and this
+        parameter does not affect them.
 
     Returns
     -------
@@ -87,8 +100,12 @@ def run_ramp_analysis(
         if (fname, sw_idx) not in collection_keys:
             continue
 
+        # Backfills shape features for spike results saved before they were
+        # measured at detection time; a no-op for current results.
+        spikes = ensure_shape_features(collection, sweep_sd, lowpass_hz)
+
         epoch_spikes = [
-            sp for sp in sweep_sd.get("spikes", [])
+            sp for sp in spikes
             if sp.get("epoch_at_threshold") == epoch_index
         ]
         if not epoch_spikes:
@@ -96,32 +113,14 @@ def run_ramp_analysis(
 
         first_spike = min(epoch_spikes, key=lambda s: s.get("threshold_time_s", float("inf")))
 
-        ref = SweepRef(
-            filename=fname,
-            sweep_index=sw_idx,
-            display_label=sweep_sd.get("display_label", f"{fname}[{sw_idx}]"),
-        )
-        try:
-            time, voltage, _ = collection.get_sweep_arrays(ref, lowpass_hz=lowpass_hz)
-        except Exception:
-            continue
-
-        shape = extract_single_spike_features(
-            time=time,
-            voltage=voltage,
-            peak_index=_time_to_index(time, first_spike["peak_time_s"]),
-            threshold_index=_time_to_index(time, first_spike["threshold_time_s"]),
-            trough_index=_time_to_index(time, first_spike["trough_time_s"]),
-        )
-
+        display_label = sweep_sd.get("display_label", f"{fname}[{sw_idx}]")
         row: dict = {
             "filename": fname,
             "sweep_index": sw_idx,
-            "display_label": ref.display_label,
+            "display_label": display_label,
         }
         for field in _CARRY_FIELDS:
             row[field] = first_spike.get(field, float("nan"))
-        row.update(shape)
 
         per_sweep_results.append(row)
 
