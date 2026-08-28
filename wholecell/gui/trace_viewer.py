@@ -27,9 +27,12 @@ The cursor sweep is always shown as a bright white trace regardless of its
 checkbox state.  Checked sweeps are shown in colour (viridis-like cycle).
 
 "Average & Analyze Subthreshold" averages all checked sweeps (same filter
-applied) and runs passive analysis on the result.  All checked sweeps must
-share the same step epoch amplitude and duration; a clear error is shown if
-they do not.  Results are stored on the Cell object for export.
+applied) and runs passive analysis on the result.  Before averaging it runs a
+spike QC pass: any checked sweep containing an action potential, plus its
+immediate same-file neighbours, is unchecked in the sweep list and so drops out
+of this and every later analysis.  All remaining sweeps must share the same
+step epoch amplitude and duration; a clear error is shown if they do not.
+Results are stored on the Cell object for export.
 
 "Find Spikes" detects spikes in all checked sweeps and stores the result on
 the Cell object.
@@ -63,6 +66,43 @@ MAX_SWEEPS_PLOTTED = 100
 def _sweep_color(index: int, n_total: int):
     import pyqtgraph as pg
     return pg.intColor(index, hues=max(n_total, 1), minValue=180)
+
+
+# ---------------------------------------------------------------------------
+# Sweep QC helpers
+# ---------------------------------------------------------------------------
+
+def _expand_with_neighbors(flagged, filenames: list[str]) -> set[int]:
+    """Expand each flagged collection position to include its neighbours.
+
+    An action potential is followed by a slow AHP that outlasts the sweep, and
+    is preceded by depolarisation, so the sweeps either side of a spiking sweep
+    are also unfit for subthreshold averaging.
+
+    Parameters
+    ----------
+    flagged : iterable of int
+        Collection positions known to contain spikes.
+    filenames : list of str
+        ``filenames[p]`` is the source file of collection position ``p``.
+
+    Returns
+    -------
+    set of int
+        The flagged positions plus every valid same-file neighbour.  Exclusion
+        never spills across a file boundary: the last sweep of one recording is
+        not the electrophysiological neighbour of the first sweep of the next.
+    """
+    out: set[int] = set()
+    n = len(filenames)
+    for p in flagged:
+        if not 0 <= p < n:
+            continue
+        out.add(p)
+        for q in (p - 1, p + 1):
+            if 0 <= q < n and filenames[q] == filenames[p]:
+                out.add(q)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +780,22 @@ class TraceViewer:
             i for i in range(self._list.count())
             if self._list.item(i).checkState() == QtCore.Qt.CheckState.Checked
         ]
+
+    def _uncheck_positions(self, positions) -> None:
+        """Uncheck sweep-list items, as if the user had clicked them off.
+
+        Signals are blocked so ``_on_item_changed`` does not trigger one full
+        replot per item; callers are responsible for the single ``_full_update``
+        that follows.
+        """
+        from pyqtgraph.Qt import QtCore
+
+        self._list.blockSignals(True)
+        for pos in positions:
+            item = self._list.item(pos)
+            if item is not None:
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        self._list.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Full refresh
@@ -1422,7 +1478,6 @@ class TraceViewer:
     # ------------------------------------------------------------------
 
     def _run_average_analysis(self) -> None:
-        from pyqtgraph.Qt import QtWidgets
         from wholecell.analysis.passive import (
             estimate_input_resistance,
             fit_time_constant,
@@ -1433,34 +1488,32 @@ class TraceViewer:
             self._results_box.setPlainText("No active collection.")
             return
 
-        self._avg_active = True
-
         checked = self._checked_sweeps()
         if len(checked) < 1:
             self._results_box.setPlainText("No sweeps checked.")
             return
 
-        # Warn if any checked sweep contains detected spikes
-        spiking = [pos for pos in checked
-                   if self._spike_data.get(
-                       (self._ref_at(pos).filename, self._ref_at(pos).sweep_index)
-                   )]
-        if not spiking:
-            spiking = self._detect_spiking_sweeps(checked)
-        if spiking:
-            spiking_labels = [self._ref_at(p).display_label for p in spiking]
-            reply = QtWidgets.QMessageBox.warning(
-                self._win,
-                "Spiking sweeps selected",
-                f"Sweep(s) {spiking_labels} appear to contain action potentials.\n\n"
-                "Subthreshold analysis on spiking data will give unreliable results.\n\n"
-                "Proceed anyway?",
-                QtWidgets.QMessageBox.StandardButton.Yes |
-                QtWidgets.QMessageBox.StandardButton.Cancel,
-                QtWidgets.QMessageBox.StandardButton.Cancel,
+        # QC: drop sweeps containing action potentials, and their immediate
+        # neighbours, before averaging.  Excluded sweeps are unchecked in the
+        # sweep list exactly as if the user had unchecked them, so they also
+        # drop out of every analysis run afterwards.
+        try:
+            checked, excluded = self._qc_exclude_spiking_sweeps(checked)
+        except Exception as exc:
+            self._results_box.setPlainText(f"Spike QC error:\n{exc}")
+            return
+        if excluded:
+            self._uncheck_positions(excluded)
+        if not checked:
+            self._full_update()
+            self._results_box.setPlainText(
+                f"All {len(excluded)} checked sweep(s) contained action "
+                "potentials or neighboured one, and were excluded.\n"
+                "Press A to re-check all sweeps."
             )
-            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
+            return
+
+        self._avg_active = True
 
         try:
             step_levels, _ = self._validate_step_command(checked)
@@ -1563,6 +1616,10 @@ class TraceViewer:
         filt_str = f"LP {self._default_lowpass_hz:.0f} Hz" if self._filter_on else "raw"
         lines = [
             f"N sweeps averaged : {len(checked)}",
+        ]
+        if excluded:
+            lines.append(f"Excluded (spike QC): {len(excluded)}")
+        lines += [
             f"Filter            : {filt_str}",
             f"Step current      : {step_current_pA:.1f} pA",
             f"Baseline voltage  : {baseline_voltage:.1f} mV",
@@ -1750,6 +1807,62 @@ class TraceViewer:
         except Exception:
             pass
         return t, i_synth
+
+    def _qc_exclude_spiking_sweeps(
+        self, checked: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Split checked sweeps into those fit for averaging and those not.
+
+        A sweep is excluded when the dV/dt detector finds an action potential
+        anywhere in it, and so are its immediate same-file neighbours (see
+        ``_expand_with_neighbors``).  Detection uses the same derivative backend
+        and dV/dt / peak-window settings as the "Find Spikes" button, and spans
+        the whole sweep rather than the step epoch — a spontaneous AP in the
+        baseline contaminates the average just as much as one during the step.
+
+        Returns
+        -------
+        (kept, excluded)
+            Collection positions, both sorted.  ``excluded`` is always a subset
+            of ``checked``; sweeps the user already unchecked are never touched.
+        """
+        from wholecell.core.sweep_collection import SweepCollection
+        from wholecell.analysis.spikes.finder import run_spike_detection
+
+        refs = [self._ref_at(pos) for pos in checked]
+        col = SweepCollection(
+            name="_viewer_qc_temp",
+            sweeps=refs,
+            recordings=self._cell.recordings,
+        )
+
+        epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
+        result = run_spike_detection(
+            col,
+            epoch_index=epoch_idx,
+            dvdt_detection_mVms=self._dvdt_spin.value(),
+            peak_search_window_ms=self._peak_window_spin.value(),
+        )
+
+        spiking_keys = {
+            (sw["filename"], sw["sweep_index"])
+            for sw in result.get("per_sweep", [])
+            if sw.get("n_spikes", 0) > 0
+        }
+        flagged = [
+            pos for pos in checked
+            if (self._ref_at(pos).filename, self._ref_at(pos).sweep_index)
+            in spiking_keys
+        ]
+        if not flagged:
+            return list(checked), []
+
+        # Neighbours are taken over collection positions, not over the checked
+        # subset, so a sweep the user already unchecked does not shift adjacency.
+        filenames = [ref.filename for ref in self._current_collection.sweeps]
+        excluded = _expand_with_neighbors(flagged, filenames) & set(checked)
+        kept = [pos for pos in checked if pos not in excluded]
+        return kept, sorted(excluded)
 
     def _detect_spiking_sweeps(self, checked: list[int]) -> list[int]:
         spiking = []
