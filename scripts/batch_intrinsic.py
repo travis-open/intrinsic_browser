@@ -22,10 +22,14 @@ step/ramp epoch from find_step_epoch.
 
 Sheet snapshot
 --------------
-``scripts/cells.csv`` is a CSV export of
+``scripts/cells_forsberg.csv`` is a CSV export of the ``cells_forsberg`` tab of
 https://docs.google.com/spreadsheets/d/1ja0srW9ut32qgVTGo8S9QUov1KxRvyKNUySP9Rx-uOM
-(tab gid=0). Refresh it with:
-    https://docs.google.com/spreadsheets/d/1ja0srW9ut32qgVTGo8S9QUov1KxRvyKNUySP9Rx-uOM/export?format=csv&gid=0
+(it is the default/first sheet, gid=0). Refresh it with:
+    https://docs.google.com/spreadsheets/d/1ja0srW9ut32qgVTGo8S9QUov1KxRvyKNUySP9Rx-uOM/gviz/tq?tqx=out:csv&sheet=cells_forsberg
+(``scripts/cells.csv`` is an older identical snapshot kept for back-compat.)
+
+Default row selection (no --cells): every row with an ``abf_folder`` and at
+least one named protocol file.
 
 Running
 -------
@@ -361,30 +365,29 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
     notes_by_protocol: dict[str, str] = {}
     small_steps_spike_data: dict | None = None
 
-    # ---- small_steps: Find Spikes + F-I Curve -------------------------------
+    # ---- small_steps: Find Spikes + F-I Curve -----------------------------
+    # Runs first: its spike result must be captured before ramp detection
+    # appends another "spikes" entry, and analyze_fi_curve reads the latest one.
     if "small_steps" in protocols:
         p, reason = resolve("small_steps")
         if p is None:
-            status_row["protocol_status"] = f"small_steps: {reason}"
-            status_row["status"] = f"error: small_steps {reason}"
-            return status_row
-        try:
-            rec = cell.add_recording(p)
-            name = rec.filename
-            epoch = args.epoch_index if args.epoch_index is not None else safe_find_step_epoch(p)
-            cell.create_sweep_collection(name, _all_sweeps(name, rec))
-            cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
-                             peak_search_window_ms=args.peak_window, lowpass_hz=args.lowpass)
-            small_steps_spike_data = cell.results["spikes"][-1]["data"]
-            cell.analyze_fi_curve(name, epoch)
-            status_row["n_sweeps"] = rec.n_sweeps
-            status_row["epoch_index"] = epoch
-            ran.append("small_steps")
-        except Exception as exc:
-            traceback.print_exc()
-            status_row["protocol_status"] = f"small_steps: error: {exc}"
-            status_row["status"] = f"error: small_steps: {exc}"
-            return status_row
+            notes_by_protocol["small_steps"] = reason
+        else:
+            try:
+                rec = cell.add_recording(p)
+                name = rec.filename
+                epoch = args.epoch_index if args.epoch_index is not None else safe_find_step_epoch(p)
+                cell.create_sweep_collection(name, _all_sweeps(name, rec))
+                cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
+                                 peak_search_window_ms=args.peak_window, lowpass_hz=args.lowpass)
+                small_steps_spike_data = cell.results["spikes"][-1]["data"]
+                cell.analyze_fi_curve(name, epoch)
+                status_row["n_sweeps"] = rec.n_sweeps
+                status_row["epoch_index"] = epoch
+                ran.append("small_steps")
+            except Exception as exc:
+                traceback.print_exc()
+                notes_by_protocol["small_steps"] = f"error: {exc}"
 
     # ---- ramp: Find Spikes (same params) + Analyze Ramp APs ---------------
     if "ramp" in protocols:
@@ -512,19 +515,24 @@ def select_rows(sheet: pd.DataFrame, cells: list[str] | None, limit: int) -> pd.
         rows["_order"] = rows["cell_id"].map({c: i for i, c in enumerate(cells)})
         return rows.sort_values("_order").drop(columns="_order")
 
-    if "small_steps_file" not in sheet.columns:
-        raise SystemExit("Sheet has no 'small_steps_file' column for default row selection.")
-    has_file = sheet[~sheet["small_steps_file"].map(_blank)].copy()
+    # Default: any row with an abf_folder and at least one named protocol file.
+    protocol_cols = [c for c in PROTOCOL_COLUMN.values() if c in sheet.columns]
+    if not protocol_cols:
+        raise SystemExit(f"Sheet has none of the protocol columns: {list(PROTOCOL_COLUMN.values())}")
+    has_folder = ~sheet.get("abf_folder", pd.Series("", index=sheet.index)).map(_blank)
+    blank_mask = sheet[protocol_cols].apply(lambda col: col.map(_blank))
+    has_any_file = ~blank_mask.all(axis=1)
+    rows = sheet[has_folder & has_any_file].copy()
     if limit and limit > 0:
-        return has_file.head(limit)
-    return has_file
+        return rows.head(limit)
+    return rows
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--sheet", type=Path, default=REPO_ROOT / "scripts" / "cells.csv",
-                        help="CSV snapshot of the cell sheet (default: scripts/cells.csv)")
+    parser.add_argument("--sheet", type=Path, default=REPO_ROOT / "scripts" / "cells_forsberg.csv",
+                        help="CSV snapshot of the cell sheet (default: scripts/cells_forsberg.csv)")
     parser.add_argument("--protocols", default=",".join(ALL_PROTOCOLS),
                         help="Comma list from: " + ",".join(ALL_PROTOCOLS) + " (default: all)")
     parser.add_argument("--cells", default="",
