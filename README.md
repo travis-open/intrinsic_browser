@@ -24,8 +24,8 @@ That's the only prerequisite. Everything else is installed automatically.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourlab/intrinsic_props.git
-cd intrinsic_props
+git clone https://github.com/travis-open/intrinsic_browser.git
+cd intrinsic_browser
 
 # 2. Create the conda environment
 conda env create -f environment.yml
