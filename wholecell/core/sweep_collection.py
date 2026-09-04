@@ -102,6 +102,11 @@ class SweepCollection:
         the collection to fetch data arrays without re-opening files.
     notes : str, optional
         Free-text annotation from the user (captured in session JSON).
+    condition : str, optional
+        Experimental condition this collection was recorded under
+        (``"control"``, ``"apamin"``, anything the user types). Free text --
+        never parsed or enumerated -- so a new drug needs no code change.
+        Results analysed from this collection are grouped by it at export.
 
     Examples
     --------
@@ -123,11 +128,13 @@ class SweepCollection:
         sweeps: list[SweepRef],
         recordings: dict[str, "Recording"],
         notes: str = "",
+        condition: str = "",
     ) -> None:
         self.name = name
         self._sweeps = list(sweeps)
         self._recordings = recordings
         self.notes = notes
+        self.condition = condition
 
         self._validate()
 
@@ -281,6 +288,7 @@ class SweepCollection:
             sweeps=remaining,
             recordings=self._recordings,
             notes=self.notes,
+            condition=self.condition,
         )
 
     # ------------------------------------------------------------------
@@ -296,6 +304,7 @@ class SweepCollection:
         return {
             "name": self.name,
             "notes": self.notes,
+            "condition": self.condition,
             "sweeps": [ref.to_dict() for ref in self._sweeps],
             "filenames": self.filenames,
         }
@@ -321,6 +330,7 @@ class SweepCollection:
             sweeps=sweeps,
             recordings=recordings,
             notes=d.get("notes", ""),
+            condition=d.get("condition", ""),
         )
 
     # ------------------------------------------------------------------

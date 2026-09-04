@@ -246,6 +246,32 @@ class TraceViewer:
         coll_row.addWidget(self._collections_combo, stretch=1)
         left_layout.addLayout(coll_row)
 
+        # Condition label for the active collection. Free text (editable combo)
+        # so any drug or timepoint name works; previously used labels are
+        # offered as items for quick reuse. Analyses run on this collection are
+        # grouped under this label at export.
+        cond_row = QtWidgets.QHBoxLayout()
+        cond_lbl = QtWidgets.QLabel("Condition:")
+        cond_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._condition_combo = QtWidgets.QComboBox()
+        self._condition_combo.setEditable(True)
+        self._condition_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self._condition_combo.lineEdit().setPlaceholderText("e.g. control")
+        self._condition_combo.setToolTip(
+            "Experimental condition for this collection (e.g. control, apamin).\n"
+            "Leave blank if the cell was recorded under a single condition."
+        )
+        self._condition_combo.setStyleSheet(
+            "QComboBox { background: #1a1a1a; color: #ddd; font-size: 11px; "
+            "border: 1px solid #444; }"
+            "QComboBox QAbstractItemView { background: #1a1a1a; color: #ddd; "
+            "selection-background-color: #2a2a4a; border: 1px solid #555; }"
+        )
+        self._condition_combo.currentTextChanged.connect(self._on_condition_changed)
+        cond_row.addWidget(cond_lbl)
+        cond_row.addWidget(self._condition_combo, stretch=1)
+        left_layout.addLayout(cond_row)
+
         # Sweep list
         sweep_lbl = QtWidgets.QLabel("Sweeps  (Space = toggle)")
         sweep_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
@@ -700,10 +726,68 @@ class TraceViewer:
             self._collections_combo.setCurrentIndex(idx)
         self._collections_combo.blockSignals(False)
 
+    def _series_for(self, result_type: str) -> list[tuple[str, dict]]:
+        """Latest result of a type per condition, for overlaying in a popup.
+
+        Returns ``[(label, data), ...]`` in condition order. Falls back to a
+        single unlabelled entry when no condition is set, so a single-condition
+        cell gets exactly the view it always had.
+        """
+        entries = self._cell.results.get(result_type) or []
+        if not entries:
+            return []
+        conditions = self._cell.conditions()
+        if not conditions:
+            return [("", entries[-1]["data"])]
+        series: list[tuple[str, dict]] = []
+        for condition in conditions:
+            matching = [
+                e for e in entries
+                if self._cell._result_condition(e) == condition
+            ]
+            if matching:
+                series.append((condition, matching[-1]["data"]))
+        return series
+
+    def _known_conditions(self) -> list[str]:
+        """Labels already in use on this cell, for the dropdown."""
+        seen: list[str] = []
+        for sc in self._cell.collections.values():
+            if sc.condition and sc.condition not in seen:
+                seen.append(sc.condition)
+        return seen
+
+    def _update_condition_combo(self) -> None:
+        """Show the active collection's condition, offering known labels."""
+        combo = self._condition_combo
+        current = self._current_collection.condition if self._current_collection else ""
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(self._known_conditions())
+        combo.setCurrentText(current)
+        combo.blockSignals(False)
+
+    def _on_condition_changed(self, text: str) -> None:
+        """Write the typed label onto the active collection.
+
+        Results already stored for this collection re-bucket automatically —
+        Cell._result_condition resolves through the live collection — so a
+        mislabelled condition can be fixed without re-running any analysis.
+        """
+        if self._current_collection is None:
+            return
+        label = text.strip()
+        if label == self._current_collection.condition:
+            return
+        self._current_collection.condition = label
+        self._refresh_analysis_checks()
+        self._update_status()
+
     def _on_collection_changed(self, name: str) -> None:
         if not name or name not in self._cell.collections:
             return
         self._current_collection = self._cell.collections[name]
+        self._update_condition_combo()
         self._update_axis_labels()
 
         # Re-detect step epoch every time the collection changes — different
@@ -967,6 +1051,7 @@ class TraceViewer:
         # Store on Cell with filename provenance
         params = {
             "collection_name": self._current_collection.name,
+            "condition": self._current_collection.condition,
             "epoch_index": epoch_idx,
             "dvdt_detection_mVms": dvdt_thresh,
             "peak_search_window_ms": peak_window,
@@ -997,15 +1082,19 @@ class TraceViewer:
             self._results_box.setPlainText("No active collection.")
             return
 
-        spikes_results = self._cell.results.get("spikes", [])
-        if not spikes_results:
+        if not self._cell.results.get("spikes"):
             self._results_box.setPlainText(
                 "No spike detection results found.\nRun Find Spikes first."
             )
             return
 
         epoch_idx = self._step_epoch_index if self._step_epoch_index is not None else 1
-        spike_entry = spikes_results[-1]
+        # Spikes detected on *this* collection, not merely the most recent ones:
+        # otherwise detecting on the apamin file and then clicking F-I with the
+        # control collection active would build a control curve from apamin spikes.
+        spike_entry = self._cell._latest_result_for_collection(
+            "spikes", self._current_collection.name
+        )
         try:
             fi_result = run_fi_analysis(
                 self._current_collection, epoch_idx, spike_entry
@@ -1016,6 +1105,7 @@ class TraceViewer:
 
         self._cell._store_result("fi_curve", fi_result, {
             "collection_name": self._current_collection.name,
+            "condition": self._current_collection.condition,
             "epoch_index": epoch_idx,
             "source": "trace_viewer",
         })
@@ -1044,8 +1134,11 @@ class TraceViewer:
         self._results_box.setPlainText("\n".join(msg_parts) if msg_parts else "F-I analysis complete.")
         self._refresh_analysis_checks()
 
+        # Overlay every condition that has an F-I result; with one condition
+        # (or none labelled) this is the single curve as before.
+        series = self._series_for("fi_curve")
         self._fi_viewer = FICurveViewer(
-            fi_result=fi_result,
+            fi_result=series if len(series) > 1 else fi_result,
             title=f"{self._cell.cell_id} — F-I Curve",
         )
         self._fi_viewer.show()
@@ -1090,6 +1183,7 @@ class TraceViewer:
 
         self._cell._store_result("ramp_evoked_APs", result, {
             "collection_name": self._current_collection.name,
+            "condition": self._current_collection.condition,
             "epoch_index": epoch_idx,
             "lowpass_hz": lowpass,
             "n_sweeps": len(checked),
@@ -1177,6 +1271,7 @@ class TraceViewer:
 
         self._cell._store_result("v_rest", result, {
             "collection_name": self._current_collection.name,
+            "condition": self._current_collection.condition,
             "lowpass_hz": lowpass,
             "n_sweeps": len(checked),
             "dvdt_detection_mVms": dvdt_thresh,
@@ -1270,6 +1365,7 @@ class TraceViewer:
 
         self._cell._store_result("ahp", result, {
             "collection_name": self._current_collection.name,
+            "condition": self._current_collection.condition,
             "epoch_index": epoch_idx,
             "lowpass_hz": lowpass,
             "n_sweeps": len(checked),
@@ -1334,8 +1430,11 @@ class TraceViewer:
         self._results_box.setPlainText("\n".join(rows_txt))
         self._refresh_analysis_checks()
 
+        # Overlay every condition that has an AHP result; with one condition
+        # (or none labelled) this is the single pair of curves as before.
+        ahp_series = self._series_for("ahp")
         self._ahp_viewer = AHPViewer(
-            ahp_result=result,
+            ahp_result=ahp_series if len(ahp_series) > 1 else result,
             title=f"{self._cell.cell_id} — AHP",
         )
         self._ahp_viewer.show()
@@ -1606,6 +1705,7 @@ class TraceViewer:
         }
         params = {
             "collection_name": self._current_collection.name,
+            "condition": self._current_collection.condition,
             "epoch_index": epoch_idx,
             "lowpass_hz": self._default_lowpass_hz if self._filter_on else None,
             "n_sweeps_averaged": len(checked),
@@ -1693,6 +1793,7 @@ class TraceViewer:
 
         params = {
             "collection_name": self._current_collection.name,
+            "condition": self._current_collection.condition,
             "epoch_index": epoch_idx,
             "lowpass_hz": lowpass,
             "n_sweeps": len(checked),
@@ -1745,13 +1846,33 @@ class TraceViewer:
         self._results_box.setPlainText("\n".join(rows_txt))
         self._refresh_analysis_checks()
 
+    def _has_result(self, result_type: str) -> bool:
+        """True if the *active condition* has a result of this type.
+
+        Cell-scoped checks would claim F-I had been run on apamin when it had
+        only been run on control, so these follow the active collection's
+        condition. With no condition set, every result counts (single-condition
+        cells behave exactly as before).
+        """
+        entries = self._cell.results.get(result_type) or []
+        if not entries:
+            return False
+        condition = (
+            self._current_collection.condition if self._current_collection else ""
+        )
+        if not condition:
+            return True
+        return any(
+            self._cell._result_condition(e) == condition for e in entries
+        )
+
     def _refresh_analysis_checks(self) -> None:
-        self._chk_fi.setChecked(bool(self._cell.results.get("fi_curve")))
-        self._chk_ramp.setChecked(bool(self._cell.results.get("ramp_evoked_APs")))
-        self._chk_avg.setChecked(bool(self._cell.results.get("passive_repeated_step")))
-        self._chk_passive.setChecked(bool(self._cell.results.get("passive_range")))
-        self._chk_vrest.setChecked(bool(self._cell.results.get("v_rest")))
-        self._chk_ahp.setChecked(bool(self._cell.results.get("ahp")))
+        self._chk_fi.setChecked(self._has_result("fi_curve"))
+        self._chk_ramp.setChecked(self._has_result("ramp_evoked_APs"))
+        self._chk_avg.setChecked(self._has_result("passive_repeated_step"))
+        self._chk_passive.setChecked(self._has_result("passive_range"))
+        self._chk_vrest.setChecked(self._has_result("v_rest"))
+        self._chk_ahp.setChecked(self._has_result("ahp"))
 
     # ------------------------------------------------------------------
     # Axis label helpers
@@ -2289,15 +2410,45 @@ class TraceViewer:
 
     def _on_export_cell_summary(self) -> None:
         from pyqtgraph.Qt import QtWidgets
+        from wholecell.core.cell import block_label
 
-        suggested = str(self._cell.output_dir / f"{self._cell.cell_id}_cell_summary.json")
+        # With two or more conditions labelled, one file cannot hold them: a
+        # summary keeps the latest result of each type, so a single file would
+        # silently drop the control results. Write one file per condition, in
+        # the same layout scripts/batch_intrinsic.py produces.
+        conditions = self._cell.conditions()
+        if len(conditions) > 1:
+            directory = QtWidgets.QFileDialog.getExistingDirectory(
+                self._win, "Save Cell Summaries (one per condition)",
+                str(self._cell.output_dir),
+            )
+            if not directory:
+                return
+            try:
+                paths = self._cell.export_condition_summaries(output_dir=directory)
+            except Exception as exc:
+                self._results_box.setPlainText(f"Export failed:\n{exc}")
+                return
+            listed = "\n".join(str(p) for p in paths)
+            self._results_box.setPlainText(
+                f"{len(paths)} cell summaries saved "
+                f"({', '.join(conditions)}):\n{listed}"
+            )
+            return
+
+        condition = conditions[0] if conditions else None
+        stem = (
+            f"{self._cell.cell_id}_cell_summary.json" if condition is None
+            else f"{block_label(self._cell.cell_id, condition, 0)}_cell_summary.json"
+        )
+        suggested = str(self._cell.output_dir / stem)
         filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
             self._win, "Save Cell Summary", suggested, "JSON files (*.json)"
         )
         if not filepath:
             return
         try:
-            self._cell.export_cell_summary(filepath=filepath)
+            self._cell.export_cell_summary(filepath=filepath, condition=condition)
             self._results_box.setPlainText(f"Cell summary saved:\n{filepath}")
         except Exception as exc:
             self._results_box.setPlainText(f"Export failed:\n{exc}")
@@ -2325,8 +2476,10 @@ class TraceViewer:
             f" | Plotting first {MAX_SWEEPS_PLOTTED} of {len(checked)} (capped)"
             if self._plot_capped else ""
         )
+        cond = self._current_collection.condition
+        cond_str = f" [{cond}]" if cond else ""
         self._status.setText(
-            f"Collection: {self._current_collection.name} | "
+            f"Collection: {self._current_collection.name}{cond_str} | "
             f"Cursor: pos {self._cursor} | Overlaid: {len(checked)}{cap_str} | "
             f"Step epoch: {epoch_str} | {filt_str} | "
             f"[↑↓ navigate | Space pin | A/N all/none | F filter | C current | D dV/dt | Q quit]"

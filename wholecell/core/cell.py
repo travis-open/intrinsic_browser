@@ -38,6 +38,7 @@ Typical interactive workflow
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -47,6 +48,29 @@ import pandas as pd
 
 from wholecell.core.recording import Recording
 from wholecell.core.sweep_collection import SweepCollection, SweepRef
+
+
+# ---------------------------------------------------------------------------
+# Output naming
+#
+# Shared by the GUI and scripts/batch_intrinsic.py so a hand-analysed cell and
+# a batch-analysed one produce the same filenames for the same block.
+# ---------------------------------------------------------------------------
+
+def safe_label(value: str) -> str:
+    """Filesystem-safe form of a condition label.
+
+    Conditions are free text, so ``apamin+ttx`` and ``5 uM`` are both
+    plausible. Collapse anything that is not alphanumeric, dash or dot to an
+    underscore.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
+    return cleaned.strip("_") or "na"
+
+
+def block_label(cell_id: str, condition: str, seq: int) -> str:
+    """Output-file stem identifying one cell at one timepoint."""
+    return f"{cell_id}__{safe_label(condition)}_s{seq}"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +92,11 @@ class Cell:
     notes : str, optional
         Free-text notes about this cell (genotype, age, condition, etc.).
         Stored in the session JSON.
+    metadata : dict, optional
+        Free-form identity fields copied verbatim into the exported cell
+        summary under a ``"metadata"`` key and into the session JSON. Used to
+        stamp a summary with which experimental block it describes (condition,
+        seq, acquisition time); ignored by every analysis.
 
     Attributes
     ----------
@@ -86,11 +115,16 @@ class Cell:
         cell_id: str,
         output_dir: str | Path = ".",
         notes: str = "",
+        metadata: dict | None = None,
     ) -> None:
         self.cell_id = cell_id
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.notes = notes
+        # Free-form identity carried through to the exported summary. Used by
+        # batch_intrinsic to stamp each block with its condition/seq/timing so
+        # a cell_summary.json describing one timepoint says so on its face.
+        self.metadata: dict = dict(metadata or {})
 
         self.recordings: dict[str, Recording] = {}
         self.collections: dict[str, SweepCollection] = {}
@@ -256,6 +290,7 @@ class Cell:
         sweeps: list[dict | SweepRef],
         notes: str = "",
         overwrite: bool = False,
+        condition: str = "",
     ) -> SweepCollection:
         """Create a named SweepCollection from a list of sweep references.
 
@@ -272,6 +307,10 @@ class Cell:
         overwrite : bool
             If True, replace an existing collection with this name.
             If False (default), raise ValueError if the name already exists.
+        condition : str, optional
+            Experimental condition label (e.g. ``"control"``, ``"apamin"``).
+            Results analysed from this collection are grouped by it in
+            :meth:`export_cell_summary`.
 
         Returns
         -------
@@ -313,6 +352,7 @@ class Cell:
             sweeps=refs,
             recordings=self.recordings,
             notes=notes,
+            condition=condition,
         )
         self.collections[name] = sc
         self._log("create_sweep_collection", {
@@ -320,6 +360,7 @@ class Cell:
             "n_sweeps": len(refs),
             "sweeps": [r.to_dict() for r in refs],
             "notes": notes,
+            "condition": condition,
         })
         return sc
 
@@ -490,7 +531,7 @@ class Cell:
         """
         from wholecell.analysis.fi_curve import run_fi_analysis
         sc = self.get_collection(collection_name)
-        spikes = self._get_latest_result("spikes")
+        spikes = self._latest_result_for_collection("spikes", collection_name)
         params = {
             "collection_name": collection_name,
             "epoch_index": epoch_index,
@@ -634,7 +675,7 @@ class Cell:
         """
         from wholecell.analysis.spikes.features import run_feature_extraction
         sc = self.get_collection(collection_name)
-        spikes = self._get_latest_result("spikes")
+        spikes = self._latest_result_for_collection("spikes", collection_name)
         params = {
             "collection_name": collection_name,
             "spike_result_timestamp": spike_result_timestamp,
@@ -791,6 +832,7 @@ class Cell:
     def export_cell_summary(
         self,
         filepath: str | Path | None = None,
+        condition: str | None = None,
     ) -> dict:
         """Export cell-level summary scalars and curves to JSON.
 
@@ -801,7 +843,15 @@ class Cell:
         Parameters
         ----------
         filepath : str or Path or None
-            Defaults to ``{output_dir}/{cell_id}_cell_summary.json``.
+            Defaults to ``{output_dir}/{cell_id}_cell_summary.json``, or to the
+            block-labelled name when ``condition`` is given.
+        condition : str or None
+            When given, include only results recorded under that condition, and
+            stamp the summary's ``metadata`` with it. This is what lets one Cell
+            holding several conditions (the GUI) emit the same per-block files a
+            one-Cell-per-block run (the batch) emits. When None (default), the
+            most recent result of each type is used regardless of condition —
+            the historical behaviour, on which the batch pipeline relies.
 
         Returns
         -------
@@ -813,20 +863,27 @@ class Cell:
             "notes": self.notes,
             "exported_at": _timestamp(),
         }
+        metadata = dict(self.metadata)
+        if condition is not None:
+            metadata["condition"] = condition
+            known = self.conditions()
+            metadata["seq"] = known.index(condition) if condition in known else 0
+        if metadata:
+            summary["metadata"] = metadata
 
         # Passive section — two independent workflows
-        if self.results.get("passive_repeated_step"):
-            data = self.results["passive_repeated_step"][-1]["data"]
+        data = self._latest_data("passive_repeated_step", condition)
+        if data:
             summary["passive_repeated_step"] = {
                 k: v for k, v in data.items() if k not in ("type", "_tau_fit")
             }
-        if self.results.get("passive_range"):
-            data = self.results["passive_range"][-1]["data"]
+        data = self._latest_data("passive_range", condition)
+        if data:
             summary["passive_range"] = data.get("cell_level", {})
 
         # Spike features section
-        if self.results.get("spike_features"):
-            data = self.results["spike_features"][-1]["data"]
+        data = self._latest_data("spike_features", condition)
+        if data:
             spike_table = data.get("spike_table", [])
             if spike_table:
                 thresholds = [s["threshold_voltage_mV"] for s in spike_table
@@ -843,39 +900,91 @@ class Cell:
                 }
 
         # F-I curve section
-        if self.results.get("fi_curve"):
-            summary["fi_curve"] = self.results["fi_curve"][-1]["data"]
+        data = self._latest_data("fi_curve", condition)
+        if data:
+            summary["fi_curve"] = data
 
         # Ramp-evoked AP section
-        if self.results.get("ramp_evoked_APs"):
-            summary["ramp_evoked_APs"] = self.results["ramp_evoked_APs"][-1]["data"]
+        data = self._latest_data("ramp_evoked_APs", condition)
+        if data:
+            summary["ramp_evoked_APs"] = data
 
         # Resting potential section — flat cell_level scalars plus the
         # per-sweep table (AP counts / ISI stats live only per sweep).
-        if self.results.get("v_rest"):
-            vr_data = self.results["v_rest"][-1]["data"]
+        vr_data = self._latest_data("v_rest", condition)
+        if vr_data:
             vr_summary = dict(vr_data.get("cell_level", {}))
             vr_summary["per_sweep"] = vr_data.get("per_sweep", [])
             summary["v_rest"] = vr_summary
 
         # AHP section — cell_level scalars plus the full per-sweep table, so
         # the raw mAHP/sAHP voltages and times are preserved in the export.
-        if self.results.get("ahp"):
-            ahp_data = self.results["ahp"][-1]["data"]
+        ahp_data = self._latest_data("ahp", condition)
+        if ahp_data:
             ahp_summary = dict(ahp_data.get("cell_level", {}))
             ahp_summary["per_sweep"] = ahp_data.get("per_sweep", [])
             summary["ahp"] = ahp_summary
 
         if filepath is None:
-            filepath = self.output_dir / f"{self.cell_id}_cell_summary.json"
+            if condition is None:
+                filepath = self.output_dir / f"{self.cell_id}_cell_summary.json"
+            else:
+                seq = summary.get("metadata", {}).get("seq", 0)
+                stem = block_label(self.cell_id, condition, seq)
+                filepath = self.output_dir / f"{stem}_cell_summary.json"
         filepath = Path(filepath)
 
         with open(filepath, "w") as f:
             json.dump(summary, f, indent=2, default=str)
 
-        self._log("export_cell_summary", {"filepath": str(filepath)})
+        self._log("export_cell_summary",
+                  {"filepath": str(filepath), "condition": condition})
         print(f"Cell summary saved: {filepath}")
         return summary
+
+    def export_condition_summaries(
+        self,
+        output_dir: str | Path | None = None,
+    ) -> list[Path]:
+        """Write one cell summary per labelled condition.
+
+        Produces exactly the files ``scripts/batch_intrinsic.py`` writes for the
+        same recordings, so a cell analysed by hand in the GUI and one analysed
+        by the batch are interchangeable downstream.
+
+        Parameters
+        ----------
+        output_dir : str or Path or None
+            Directory to write into. Defaults to ``self.output_dir``.
+
+        Returns
+        -------
+        list of Path
+            The files written, in condition order.
+
+        Raises
+        ------
+        ValueError
+            If no collection carries a condition label.
+        """
+        conditions = self.conditions()
+        if not conditions:
+            raise ValueError(
+                "No conditions are labelled on this cell. Set a condition on at "
+                "least one sweep collection, or use export_cell_summary() for a "
+                "single unlabelled summary."
+            )
+
+        out_dir = Path(output_dir) if output_dir is not None else self.output_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        written: list[Path] = []
+        for seq, condition in enumerate(conditions):
+            stem = block_label(self.cell_id, condition, seq)
+            path = out_dir / f"{stem}_cell_summary.json"
+            self.export_cell_summary(filepath=path, condition=condition)
+            written.append(path)
+        return written
 
     # ------------------------------------------------------------------
     # Session persistence
@@ -905,6 +1014,7 @@ class Cell:
         session = {
             "cell_id": self.cell_id,
             "notes": self.notes,
+            "metadata": self.metadata,
             "saved_at": _timestamp(),
             "recordings": {
                 name: rec.to_dict()
@@ -947,6 +1057,7 @@ class Cell:
         cell = cls(
             cell_id=session["cell_id"],
             notes=session.get("notes", ""),
+            metadata=session.get("metadata"),
         )
 
         for name, rec_dict in session["recordings"].items():
@@ -985,20 +1096,96 @@ class Cell:
         self._log(f"analyze_{result_type}", {"params": params, "timestamp": entry["timestamp"]})
         return entry
 
-    def _get_latest_result(self, result_type: str) -> dict:
+    def _result_condition(self, entry: dict) -> str:
+        """Condition label a stored result belongs to.
+
+        Resolved from the *live* collection named in the result's params, so
+        re-labelling a collection retroactively re-buckets its results — a
+        mislabelled condition can be fixed without re-running the analysis.
+        Falls back to the label frozen into params when the collection is gone
+        (e.g. a session saved by an older version, or a batch-produced Cell).
+        """
+        params = entry.get("params") or {}
+        name = params.get("collection_name")
+        if name and name in self.collections:
+            return self.collections[name].condition
+        return params.get("condition", "") or ""
+
+    def conditions(self) -> list[str]:
+        """Distinct non-empty condition labels, in collection order.
+
+        Collection order defines ``seq`` for output filenames: the first
+        labelled collection is seq 0, the next distinct label seq 1, and so on.
+        ``self.collections`` is insertion-ordered and is populated in sorted
+        ABF-filename order, which is acquisition order for Clampex files.
+        """
+        seen: list[str] = []
+        for sc in self.collections.values():
+            if sc.condition and sc.condition not in seen:
+                seen.append(sc.condition)
+        # A result whose collection has since been removed still deserves a
+        # bucket, so sweep the stored results for labels not already seen.
+        for entries in self.results.values():
+            for entry in entries:
+                cond = self._result_condition(entry)
+                if cond and cond not in seen:
+                    seen.append(cond)
+        return seen
+
+    def _get_latest_result(self, result_type: str,
+                           condition: str | None = None) -> dict:
         """Return the most recent result of a given type.
+
+        Parameters
+        ----------
+        result_type : str
+            Result key, e.g. ``"spikes"`` or ``"fi_curve"``.
+        condition : str or None
+            When given, return the most recent result recorded under that
+            condition. When None (default), the most recent result of any
+            condition — the historical behaviour.
 
         Raises
         ------
         KeyError
-            If no results of that type exist yet.
+            If no matching results exist yet.
         """
-        if result_type not in self.results or not self.results[result_type]:
+        entries = self.results.get(result_type) or []
+        if condition is not None:
+            entries = [e for e in entries if self._result_condition(e) == condition]
+        if not entries:
+            where = f" for condition '{condition}'" if condition is not None else ""
             raise KeyError(
-                f"No '{result_type}' results found. "
+                f"No '{result_type}' results found{where}. "
                 f"Run the corresponding analysis first."
             )
-        return self.results[result_type][-1]
+        return entries[-1]
+
+    def _latest_result_for_collection(self, result_type: str,
+                                      collection_name: str) -> dict:
+        """Latest result of a type produced from a given collection.
+
+        Falls back to the globally latest result when none was recorded against
+        that collection. This matters once one Cell holds several conditions:
+        detecting spikes on the apamin file must not silently feed the control
+        F-I curve. With one collection per Cell (the batch) it selects the same
+        entry ``_get_latest_result`` would.
+        """
+        entries = self.results.get(result_type) or []
+        matching = [
+            e for e in entries
+            if (e.get("params") or {}).get("collection_name") == collection_name
+        ]
+        if matching:
+            return matching[-1]
+        return self._get_latest_result(result_type)
+
+    def _latest_data(self, result_type: str, condition: str | None = None):
+        """``_get_latest_result(...)["data"]``, or None when there is none."""
+        try:
+            return self._get_latest_result(result_type, condition)["data"]
+        except KeyError:
+            return None
 
     def _log(self, action: str, details: dict) -> None:
         """Append an entry to the audit log."""

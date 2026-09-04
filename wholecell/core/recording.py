@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -171,6 +172,22 @@ class Recording:
     def sampling_rate_hz(self) -> float:
         """Sampling rate in Hz."""
         return self._abf.dataRate
+
+    @property
+    def recorded_at(self) -> datetime | None:
+        """Wall-clock acquisition start time from the ABF header.
+
+        This is when the data was *acquired* (pyabf's ``abfDateTime``), not
+        when it was analysed. It is the only field that can order two
+        recordings of the same protocol within a cell. ``None`` if the header
+        does not carry it.
+        """
+        return getattr(self._abf, "abfDateTime", None)
+
+    @property
+    def protocol_name(self) -> str:
+        """Protocol name recorded in the ABF header (the Clampex protocol)."""
+        return getattr(self._abf, "protocol", "unknown")
 
     @property
     def qc_metrics(self) -> list[SweepQCMetrics]:
@@ -393,12 +410,15 @@ class Recording:
         Note: raw data is not serialised — only the filepath and metadata
         needed to reload the file.
         """
+        recorded_at = self.recorded_at
         return {
             "filepath": str(self.filepath),
             "filename": self.filename,
             "n_sweeps": self.n_sweeps,
             "sampling_rate_hz": self.sampling_rate_hz,
             "sweep_duration_s": self.sweep_duration_s,
+            "recorded_at": recorded_at.isoformat() if recorded_at else None,
+            "protocol_name": self.protocol_name,
         }
 
     # ------------------------------------------------------------------

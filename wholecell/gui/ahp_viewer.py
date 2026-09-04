@@ -21,6 +21,15 @@ SAHP_COLOR = "#fa4"
 
 _RADIO_COLOR = "#ccc"
 
+# Per-condition colours, used only when more than one condition is overlaid.
+# With one condition, colour means measure (mAHP/sAHP) as it always has; with
+# several, colour means condition and the measure is carried by line style and
+# symbol, because colour cannot encode both.
+CONDITION_COLORS = ["#4af", "#f66", "#6d6", "#fa4", "#a8f", "#4dd"]
+
+# measure key -> (display label, symbol)
+MEASURES = {"mahp": ("mAHP", "o"), "sahp": ("sAHP", "s")}
+
 
 def _finite_pairs(xs: list, ys: list) -> tuple[list, list]:
     """Return (x, y) with any pair containing a missing value dropped."""
@@ -55,43 +64,52 @@ def _add_radio_row(QtWidgets, layout, label_text, radios, group) -> None:
     layout.addLayout(row)
 
 
+def _parse(result: dict) -> dict:
+    """Flatten one ahp result dict into the arrays the plot needs."""
+    curve = result.get("ahp_curve", {}) or {}
+    return {
+        "currents": curve.get("step_current_pA", []),
+        "cell_level": result.get("cell_level", {}) or {},
+        "measures": {
+            "mahp": {
+                "delta": curve.get("mahp_delta_mV", []),
+                "absolute": curve.get("mahp_voltage_mV", []),
+            },
+            "sahp": {
+                "delta": curve.get("sahp_delta_mV", []),
+                "absolute": curve.get("sahp_voltage_mV", []),
+            },
+        },
+    }
+
+
+def _normalise(ahp_result) -> list[tuple[str, dict]]:
+    """Accept a single result dict or a list of ``(label, result)`` pairs."""
+    if isinstance(ahp_result, dict):
+        return [("", _parse(ahp_result))]
+    return [(str(label), _parse(res)) for label, res in ahp_result]
+
+
 class AHPViewer:
     """AHP popup window backed by pyqtgraph.
 
     Parameters
     ----------
-    ahp_result : dict
-        The ``"data"`` field of a timestamped ahp result from Cell.
-        Must have keys ``"ahp_curve"`` and ``"cell_level"``.
+    ahp_result : dict or list of (str, dict)
+        Either the ``"data"`` field of a timestamped ahp result from Cell
+        (keys ``"ahp_curve"`` and ``"cell_level"``), or a list of
+        ``(condition_label, result)`` pairs to overlay on one axes.
     title : str, optional
         Window title.
     """
 
-    def __init__(self, ahp_result: dict, title: str = "AHP") -> None:
+    def __init__(self, ahp_result, title: str = "AHP") -> None:
         import pyqtgraph as pg
         from pyqtgraph.Qt import QtWidgets
 
         self._result = ahp_result
-        curve = ahp_result.get("ahp_curve", {})
-        self._cell_level = ahp_result.get("cell_level", {})
-
-        self._currents = curve.get("step_current_pA", [])
-        self._series = {
-            "mahp": {
-                "delta": curve.get("mahp_delta_mV", []),
-                "absolute": curve.get("mahp_voltage_mV", []),
-                "color": MAHP_COLOR,
-                "symbol": "o",
-                "label": "mAHP",
-            },
-            "sahp": {
-                "delta": curve.get("sahp_delta_mV", []),
-                "absolute": curve.get("sahp_voltage_mV", []),
-                "color": SAHP_COLOR,
-                "symbol": "s",
-                "label": "sAHP",
-            },
-        }
+        self._conditions = _normalise(ahp_result)
+        self._multi = len(self._conditions) > 1
 
         app = QtWidgets.QApplication.instance()
         if app is None:
@@ -121,11 +139,15 @@ class AHPViewer:
         self._quantity_group = QtWidgets.QButtonGroup(self._win)
 
         # The measure labels are tinted to their series colour — this is the
-        # plot's key. "Both" stays grey: it is not a series of its own.
+        # plot's key. "Both" stays grey: it is not a series of its own. When
+        # conditions are overlaid, colour encodes condition instead, so the
+        # tint would be a lie and the legend becomes the key.
+        mahp_tint = _RADIO_COLOR if self._multi else MAHP_COLOR
+        sahp_tint = _RADIO_COLOR if self._multi else SAHP_COLOR
         _add_radio_row(
             QtWidgets, layout, "Show:",
-            ((self._radio_mahp, MAHP_COLOR),
-             (self._radio_sahp, SAHP_COLOR),
+            ((self._radio_mahp, mahp_tint),
+             (self._radio_sahp, sahp_tint),
              (self._radio_both, _RADIO_COLOR)),
             self._measure_group,
         )
@@ -180,21 +202,43 @@ class AHPViewer:
             "sahp": self._radio_sahp.isChecked() or self._radio_both.isChecked(),
         }
 
-        for key, spec in self._series.items():
-            if not show[key]:
-                continue
-            x_vals, y_vals = _finite_pairs(self._currents, spec[quantity])
-            if not x_vals:
-                continue
-            pw.plot(
-                x_vals,
-                y_vals,
-                pen=pg.mkPen(spec["color"], width=2),
-                symbol=spec["symbol"],
-                symbolBrush=spec["color"],
-                symbolSize=7,
-                name=spec["label"],
-            )
+        if self._multi:
+            # Only worth a legend when there is something to tell apart.
+            pw.addLegend(offset=(-10, 10), labelTextColor="#ccc")
+
+        info_lines = []
+        for index, (label, data) in enumerate(self._conditions):
+            for key, (measure_label, symbol) in MEASURES.items():
+                if not show[key]:
+                    continue
+                x_vals, y_vals = _finite_pairs(
+                    data["currents"], data["measures"][key][quantity]
+                )
+                if not x_vals:
+                    continue
+                if self._multi:
+                    color = CONDITION_COLORS[index % len(CONDITION_COLORS)]
+                    style = QtCore.Qt.SolidLine if key == "mahp" else QtCore.Qt.DashLine
+                    name = f"{label} — {measure_label}"
+                else:
+                    color = MAHP_COLOR if key == "mahp" else SAHP_COLOR
+                    style = QtCore.Qt.SolidLine
+                    name = measure_label
+                pw.plot(
+                    x_vals,
+                    y_vals,
+                    pen=pg.mkPen(color, width=2, style=style),
+                    symbol=symbol,
+                    symbolBrush=color,
+                    symbolSize=7,
+                    name=name,
+                )
+            parts = self._info_parts(data["cell_level"])
+            if parts:
+                info_lines.append(
+                    f"{label}:  {'    '.join(parts)}" if self._multi
+                    else "    ".join(parts)
+                )
 
         if show_delta:
             pw.addItem(pg.InfiniteLine(
@@ -203,11 +247,11 @@ class AHPViewer:
                 pen=pg.mkPen("#666", width=1, style=QtCore.Qt.DashLine),
             ))
 
-        self._info_box.setText("    ".join(self._info_parts()))
+        self._info_box.setText("\n".join(info_lines))
 
-    def _info_parts(self) -> list[str]:
+    @staticmethod
+    def _info_parts(cl: dict) -> list[str]:
         """Cell-level summary strings for the info label."""
-        cl = self._cell_level
         parts = []
 
         for key, label in (("mahp", "mAHP"), ("sahp", "sAHP")):

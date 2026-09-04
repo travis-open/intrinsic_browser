@@ -117,11 +117,127 @@ python -m wholecell.gui.trace_viewer path/to/cell_session.json
 
 Optional flags: `--cell-id`, `--lowpass <Hz>`, `--epoch <index>`.
 
+### Conditions in the viewer
+
+The **Condition** box under the collection selector labels the active collection —
+`control`, `apamin`, `wash`, anything you type. It is free text: no drug list to
+maintain, no code change for a new one.
+
+1. Pick a collection (one is auto-created per ABF file), type its condition.
+2. Run the analyses as usual. Results are recorded against that label.
+3. **Export ▸ Cell Summary (JSON)** — with two or more conditions labelled it asks for
+   a *directory* and writes one summary per condition, in exactly the layout
+   `scripts/batch_intrinsic.py` produces. A cell analyzed by hand and one analyzed by
+   the batch are interchangeable downstream.
+
+The label lives on the collection, so it survives **Save Session**, and re-labelling a
+collection re-files results that were already analyzed — a mislabelled condition can be
+fixed without re-running anything.
+
+Two things follow the active condition rather than the cell: the analysis "done"
+checkboxes, and the spike results the F-I curve is built from. Detecting spikes on the
+apamin file no longer feeds a control F-I curve.
+
+Once a second condition has been analyzed, the **F-I** and **AHP** popups overlay all of
+them on one axes with a legend, so a drug effect is visible at the rig.
+
+> Without any condition set, everything behaves exactly as before: one summary file, one
+> set of curves.
+
+---
+
+## Batch analysis and repeated measurements
+
+`scripts/batch_intrinsic.py` is the headless mirror of the GUI buttons, applied
+over a manifest of recordings.
+
+### The block model
+
+The unit of analysis is a **block**: `(cell_id, seq)` — the set of protocol files
+acquired together at one timepoint, labelled by a free-text `condition`. A cell
+measured at baseline and again after a drug has two blocks and produces two rows
+of output.
+
+- `seq` orders blocks within a cell (0, 1, 2 …). `condition` names them. Two
+  apamin blocks during a wash-in are `seq=1` and `seq=2`, both
+  `condition="apamin"`.
+- `condition` is never parsed or enumerated in code, so a new drug — or a third,
+  or a time course — needs no code change. Drug identity is data, not schema.
+- Each block gets its own `Cell` object holding at most one file per protocol.
+- Blank `seq`/`condition` collapse to a single `baseline` block per cell, which
+  is the one-row-per-cell behaviour of the pre-block-model pipeline exactly.
+
+### The manifest
+
+A long CSV, **one row per ABF file**:
+
+| column | required | meaning |
+|--------|----------|---------|
+| `cell_id` | yes | joins to the cells / animals tables |
+| `abf_folder` | yes | directory holding the file |
+| `abf_file` | yes | one filename — no lists |
+| `protocol` | yes | `small_steps`, `ramp`, `sagIh`, `hyperpol`, `free_run` |
+| `condition` | no | free text; blank → `baseline` |
+| `seq` | no | block index within the cell; blank → `0` |
+| `drug` | no | uninterpreted passthrough |
+| `concentration` | no | uninterpreted passthrough |
+| `exclude` | no | non-blank drops that recording |
+| `notes` | no | free text |
+
+Cell- and animal-level metadata (`mouse_id`, `treatment`, `sex`, cell type) stay
+in their own tables and are joined on `cell_id` / `mouse_id` downstream.
+
+`scripts/sheet_to_long.py` converts the older wide cell sheet (one column per
+protocol) into this schema, mapping the `*_apamin_*` columns to
+`condition=apamin, seq=1`.
+
+```bash
+python scripts/sheet_to_long.py --sheet scripts/cells_forsberg.csv --out scripts/recordings.csv
+python scripts/batch_intrinsic.py --validate-only --limit 0
+python scripts/batch_intrinsic.py --limit 0
+```
+
+`--validate-only` checks the manifest and every file path without loading sample
+data: it reports blocks whose `condition` is inconsistent, blocks naming the same
+protocol twice (a mis-entered `seq`), protocols with no analyzer, missing files,
+and cells whose `seq` order disagrees with the ABF acquisition clock.
+
+Useful flags: `--cells`, `--conditions`, `--protocols`, `--limit` (blocks, not
+cells), `--output-dir`.
+
+### Batch outputs
+
+| File | Contents |
+|------|----------|
+| `batch_summary.csv` | **long** — one row per block, with `condition`, `seq`, `recorded_at`, `minutes_from_first`, and the cell-level feature columns (`fi__*`, `vrest__*`, `sag_passive__*`, `avg_passive__*`, `ramp__*`, `ahp__*`) |
+| `{block}_cell_summary.json` | all analysis sections for one block, stamped with a `metadata` stanza naming its condition and seq |
+| `{block}_spikes_{protocol}.csv` | per-spike table, one per protocol that ran spike detection |
+
+where `{block}` is `{cell_id}__{condition}_s{seq}`. Read output paths from
+`batch_summary.csv` rather than reconstructing them.
+
+The GUI writes the same per-block summaries (see
+[Conditions in the viewer](#conditions-in-the-viewer)), so hand-analyzed and
+batch-analyzed cells can be aggregated together.
+
+Because the feature columns are the same regardless of how many conditions a cell
+has, a paired comparison is a pivot:
+
+```python
+import pandas as pd
+
+df = pd.read_csv("test_outputs/long_full/batch_summary.csv")
+wide = df.pivot(index="cell_id", columns="condition", values="ahp__mean_mahp_delta_mV")
+wide["delta"] = wide["apamin"] - wide["baseline"]
+```
+
 ---
 
 ## Output files
 
-For each cell, analysis produces the following files in the specified `output_dir`:
+These are the files the **interactive / GUI** workflow writes into `output_dir`.
+The batch pipeline writes a different, block-keyed set — see
+[Batch outputs](#batch-outputs) above.
 
 | File | Contents |
 |------|----------|
@@ -224,7 +340,13 @@ intrinsic_props/
 ├── environment.yml         # conda environment specification
 ├── pyproject.toml          # package metadata
 ├── README.md
+├── scripts/
+│   ├── batch_intrinsic.py      # headless batch driver (block model)
+│   ├── sheet_to_long.py        # wide cell sheet -> long recordings manifest
+│   ├── first_last_spike.py     # per-sweep first/last AP timing from summaries
+│   └── recordings.csv          # generated long manifest
 └── wholecell/              # importable package
+    ├── config.py               # user settings (~/.wholecell/settings.json)
     ├── core/
     │   ├── cell.py             # top-level analysis object
     │   ├── recording.py        # single ABF file wrapper
@@ -232,6 +354,9 @@ intrinsic_props/
     ├── analysis/
     │   ├── passive.py          # Rin, tau, sag
     │   ├── fi_curve.py         # F-I curve, rheobase, slope
+    │   ├── ahp.py              # post-step mAHP / sAHP
+    │   ├── ramp.py             # ramp-evoked AP features
+    │   ├── vrest.py            # resting Vm, spontaneous firing
     │   └── spikes/
     │       ├── base.py         # SpikeFinder interface
     │       ├── derivative.py   # built-in dV/dt finder
@@ -240,6 +365,10 @@ intrinsic_props/
     │       └── features.py     # spike shape feature extraction
     ├── filters/
     │   └── lowpass.py          # zero-phase Butterworth filter
+    ├── gui/
+    │   ├── trace_viewer.py     # interactive PyQt/pyqtgraph viewer
+    │   ├── fi_viewer.py        # F-I curve popup
+    │   └── ahp_viewer.py       # AHP popup
     └── io/
         └── abf_reader.py       # ABF inspection and epoch utilities
 ```

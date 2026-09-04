@@ -1,37 +1,63 @@
 """
 batch_intrinsic.py
 ------------------
-Apply a consistent intrinsic-properties analysis to a list of cells described in
-a spreadsheet, reproducing the trace_viewer GUI buttons for each protocol file.
+Apply a consistent intrinsic-properties analysis to a list of recordings
+described in a long manifest, reproducing the trace_viewer GUI buttons for each
+protocol file.
 
-Per cell row, for every protocol column that names a single existing ABF file:
+The block model
+---------------
+The unit of analysis is a **block**: ``(cell_id, seq)`` -- the set of protocol
+files acquired together at one timepoint, labelled by a free-text
+``condition``. A cell measured at baseline and again in apamin has two blocks
+and produces two output rows.
 
-    small_steps_file  ->  Find Spikes  +  F-I Curve  +  Analyze AHP
-    free_run_file     ->  Measure V_rest
-    ramp_file         ->  Find Spikes (same params)  +  Analyze Ramp APs
-    sagIh_file        ->  Analyze Each Sweep (Passive)
-    hyperpol_file     ->  Average & Analyze Subthreshold
+``seq`` orders blocks within a cell (0, 1, 2 ...); ``condition`` names them. Two
+apamin blocks during a wash-in are ``seq=1`` and ``seq=2``, both
+``condition="apamin"``. Nothing in this file enumerates conditions or drug
+names, so a new drug -- or a third, or a time course -- needs no code change.
+
+Each block gets its own ``Cell`` object holding at most one file per protocol,
+so ``Cell``'s last-wins ``results[...][-1]`` semantics stay harmless. Blank
+``seq``/``condition`` collapse to a single ``baseline`` block per cell, which is
+the old one-row-per-cell behaviour exactly.
+
+Per block, for every protocol row naming an existing ABF file:
+
+    small_steps  ->  Find Spikes  +  F-I Curve  +  Analyze AHP
+    ramp         ->  Find Spikes (same params)  +  Analyze Ramp APs
+    sagIh        ->  Analyze Each Sweep (Passive)
+    hyperpol     ->  Average & Analyze Subthreshold
+    free_run     ->  Measure V_rest
 
 Outputs (into --output-dir, default <repo>/test_outputs):
-    <cell_id>_spikes_<protocol>.csv  per-spike table (GUI-faithful), one per
-                                     protocol that ran Find Spikes:
-                                     small_steps, ramp, free_run
-    <cell_id>_cell_summary.json  Cell.export_cell_summary — all analysis sections
-    batch_summary.csv            one row per cell: status + curated cell-level features
+    <block>_spikes_<protocol>.csv  per-spike table (GUI-faithful), one per
+                                   protocol that ran Find Spikes
+    <block>_cell_summary.json      Cell.export_cell_summary -- all sections,
+                                   stamped with the block's metadata
+    batch_summary.csv              LONG: one row per block, same cell-level
+                                   feature columns as before
+
+where ``<block>`` is ``{cell_id}__{condition}_s{seq}``. Downstream code should
+read output paths from ``batch_summary.csv`` rather than reconstructing them.
 
 This mirrors the GUI: derivative spike backend, filter off (lowpass_hz=None),
 step/ramp epoch from find_step_epoch.
 
-Sheet snapshot
---------------
-``scripts/cells_forsberg.csv`` is a CSV export of the ``cells_forsberg`` tab of
-https://docs.google.com/spreadsheets/d/1ja0srW9ut32qgVTGo8S9QUov1KxRvyKNUySP9Rx-uOM
-(it is the default/first sheet, gid=0). Refresh it with:
-    https://docs.google.com/spreadsheets/d/1ja0srW9ut32qgVTGo8S9QUov1KxRvyKNUySP9Rx-uOM/gviz/tq?tqx=out:csv&sheet=cells_forsberg
-(``scripts/cells.csv`` is an older identical snapshot kept for back-compat.)
+Manifest
+--------
+A long CSV, one row per ABF file, with columns:
 
-Default row selection (no --cells): every row with an ``abf_folder`` and at
-least one named protocol file.
+    cell_id, abf_folder, abf_file, protocol, condition, seq,
+    drug, concentration, exclude, notes
+
+``condition`` defaults to ``baseline`` and ``seq`` to ``0`` when blank;
+``drug``/``concentration``/``notes`` are uninterpreted passthrough; a non-blank
+``exclude`` drops that recording. Generate one from the old wide cell sheet
+with ``scripts/sheet_to_long.py``.
+
+Cell- and animal-level metadata (mouse_id, treatment, sex, cell type) live in
+their own tables and are joined on ``cell_id`` / ``mouse_id`` downstream.
 
 Running
 -------
@@ -44,14 +70,17 @@ or ``conda activate intrinsic_props`` first, then ``python scripts/batch_intrins
 
 Examples
 --------
-    # Test run: first 3 cells, all protocols, dvdt 3.0, peak window 10.0
-    conda run --no-capture-output -n intrinsic_props python scripts/batch_intrinsic.py
+    # Check the manifest without loading any data
+    ... python scripts/batch_intrinsic.py --validate-only --limit 0
 
-    # Only the current-step protocols, explicit cells
-    ... python scripts/batch_intrinsic.py --protocols small_steps,sagIh,hyperpol \
+    # Test run: first 3 blocks, all protocols
+    ... python scripts/batch_intrinsic.py
+
+    # Baseline only, explicit cells (reproduces the pre-block-model output)
+    ... python scripts/batch_intrinsic.py --conditions baseline \
         --cells 20260607_cell7_JMT,20260610_cell5_JMT
 
-    # Everything in the sheet
+    # Everything in the manifest
     ... python scripts/batch_intrinsic.py --limit 0
 """
 
@@ -59,6 +88,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -82,21 +112,30 @@ from wholecell.analysis.passive import (
 )
 
 
-# protocol name -> sheet column. Order = execution order (small_steps first: it
-# feeds the F-I curve and its spikes result must be captured before ramp
-# detection appends another "spikes" entry).
-PROTOCOL_COLUMN = {
-    "small_steps": "small_steps_file",
-    "ramp": "ramp_file",
-    "sagIh": "sagIh_file",
-    "hyperpol": "hyperpol_file",
-    "free_run": "free_run_file",
-}
-ALL_PROTOCOLS = list(PROTOCOL_COLUMN)
+MANIFEST_COLUMNS = [
+    "cell_id",
+    "abf_folder",
+    "abf_file",
+    "protocol",
+    "condition",
+    "seq",
+    "drug",
+    "concentration",
+    "exclude",
+    "notes",
+]
+
+DEFAULT_CONDITION = "baseline"
 
 IDENTITY_COLUMNS = [
     "cell_id",
-    "small_steps_file",
+    "condition",
+    "seq",
+    "drug",
+    "concentration",
+    "abf_files",
+    "recorded_at",
+    "minutes_from_first",
     "n_sweeps",
     "epoch_index",
     "n_spikes_total",
@@ -162,9 +201,23 @@ def _blank(value) -> bool:
     return value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() == ""
 
 
-def _looks_like_multi_file(value: str) -> bool:
-    """True if a ``*_file`` cell names more than one ABF (e.g. apamin pairs)."""
-    return "[" in value or "," in value
+def _text(value) -> str:
+    return "" if _blank(value) else str(value).strip()
+
+
+def _safe_label(value: str) -> str:
+    """Filesystem-safe form of a condition label.
+
+    Conditions are free text, so ``apamin+ttx`` and ``5 uM`` are both plausible.
+    Collapse anything that is not alphanumeric, dash or dot to an underscore.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return cleaned.strip("_") or "na"
+
+
+def block_label(cell_id: str, condition: str, seq: int) -> str:
+    """Output-file stem identifying one block."""
+    return f"{cell_id}__{_safe_label(condition)}_s{seq}"
 
 
 def safe_find_step_epoch(path: Path, fallback: int = 1) -> int:
@@ -177,6 +230,20 @@ def safe_find_step_epoch(path: Path, fallback: int = 1) -> int:
 
 def _all_sweeps(name: str, rec) -> list[dict]:
     return [{"filename": name, "sweep_index": i} for i in range(rec.n_sweeps)]
+
+
+def peek_recorded_at(path: Path):
+    """Acquisition time from an ABF header without loading sample data.
+
+    Used only by ``--validate-only``, where reading every sweep of 600+ files
+    to check ordering would defeat the point.
+    """
+    try:
+        import pyabf
+
+        return pyabf.ABF(str(path), loadData=False).abfDateTime
+    except Exception:
+        return None
 
 
 def build_spike_table(spike_result_data: dict) -> pd.DataFrame:
@@ -298,7 +365,204 @@ def run_average_subthreshold(cell: Cell, name: str, epoch_index: int,
 
 
 # ---------------------------------------------------------------------------
-# per-cell processing
+# protocol runners
+#
+# Each runner loads one ABF into the block's Cell, runs the analyses the GUI
+# would run for that protocol, and returns the labels to record in
+# ``protocols_run``. ``ctx`` carries the CLI args plus the two side-channels a
+# runner may write to: detected spikes (one CSV per protocol) and the status
+# fields that only small_steps knows.
+# ---------------------------------------------------------------------------
+
+class BlockContext:
+    """Mutable scratch space shared by the runners within one block."""
+
+    def __init__(self, args) -> None:
+        self.args = args
+        self.spike_data: dict[str, dict] = {}   # protocol -> detection result
+        self.stats: dict[str, object] = {}      # n_sweeps / epoch_index
+        self.errors: dict[str, str] = {}        # sub-analysis failures (e.g. ahp)
+
+
+def _prepare(cell: Cell, path: Path):
+    """Load an ABF and give it an all-sweeps collection. Returns (name, rec)."""
+    rec = cell.add_recording(path)
+    name = rec.filename
+    cell.create_sweep_collection(name, _all_sweeps(name, rec))
+    return name, rec
+
+
+def _run_small_steps(cell: Cell, path: Path, ctx: BlockContext) -> list[str]:
+    """Find Spikes + F-I Curve + Analyze AHP on a current-step family."""
+    args = ctx.args
+    name, rec = _prepare(cell, path)
+    epoch = args.epoch_index if args.epoch_index is not None else safe_find_step_epoch(path)
+    cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
+                     peak_search_window_ms=args.peak_window, lowpass_hz=args.lowpass)
+    ctx.spike_data["small_steps"] = cell.results["spikes"][-1]["data"]
+    cell.analyze_fi_curve(name, epoch)
+    ctx.stats["n_sweeps"] = rec.n_sweeps
+    ctx.stats["epoch_index"] = epoch
+    ran = ["small_steps"]
+
+    # AHP: same current-step collection / epoch as the F-I curve, no spike
+    # detection required (trace_viewer._run_ahp_analysis). Own try/except so an
+    # AHP failure doesn't undo the F-I result.
+    try:
+        cell.analyze_ahp(name, epoch)  # GUI defaults: 2 kHz, 100/1000 ms
+        ran.append("ahp")
+    except Exception as exc:
+        traceback.print_exc()
+        ctx.errors["ahp"] = f"error: {exc}"
+    return ran
+
+
+def _run_ramp(cell: Cell, path: Path, ctx: BlockContext) -> list[str]:
+    """Find Spikes (same params) + Analyze Ramp APs."""
+    args = ctx.args
+    name, _ = _prepare(cell, path)
+    epoch = safe_find_step_epoch(path)
+    cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
+                     peak_search_window_ms=args.peak_window,
+                     lowpass_hz=args.lowpass)
+    ctx.spike_data["ramp"] = cell.results["spikes"][-1]["data"]
+    result = run_ramp_analysis(
+        cell.collections[name], epoch, cell.results["spikes"][-1],
+        lowpass_hz=args.lowpass,
+    )
+    cell._store_result("ramp_evoked_APs", result, {
+        "collection_name": name, "epoch_index": epoch,
+        "source": "batch_intrinsic",
+    })
+    return ["ramp"]
+
+
+def _run_sag_ih(cell: Cell, path: Path, ctx: BlockContext) -> list[str]:
+    """Analyze Each Sweep (Passive) -> stores "passive_range"."""
+    name, _ = _prepare(cell, path)
+    epoch = safe_find_step_epoch(path)
+    cell.analyze_passive(name, epoch)
+    return ["sagIh"]
+
+
+def _run_hyperpol(cell: Cell, path: Path, ctx: BlockContext) -> list[str]:
+    """Average & Analyze Subthreshold -> stores "passive_repeated_step"."""
+    name, _ = _prepare(cell, path)
+    epoch = safe_find_step_epoch(path)
+    result = run_average_subthreshold(cell, name, epoch, lowpass_hz=ctx.args.lowpass)
+    cell._store_result("passive_repeated_step", result, {
+        "collection_name": name, "epoch_index": epoch,
+        "n_sweeps_averaged": result["n_sweeps_averaged"],
+        "source": "batch_intrinsic",
+    })
+    return ["hyperpol"]
+
+
+def _run_free_run(cell: Cell, path: Path, ctx: BlockContext) -> list[str]:
+    """Measure V_rest on a free-running (no command) file."""
+    args = ctx.args
+    name, _ = _prepare(cell, path)
+    result = run_vrest_analysis(
+        cell.collections[name], lowpass_hz=args.lowpass,
+        dvdt_detection_mVms=args.dvdt,
+        peak_search_window_ms=args.peak_window,
+    )
+    if result.get("spike_detection") is not None:
+        ctx.spike_data["free_run"] = result["spike_detection"]
+    cell._store_result("v_rest", result, {
+        "collection_name": name, "source": "batch_intrinsic",
+    })
+    return ["free_run"]
+
+
+# Key order is the execution order within a block, and it is load-bearing:
+# small_steps must precede ramp, because analyze_fi_curve reads
+# results["spikes"][-1] and ramp detection appends another "spikes" entry.
+PROTOCOL_RUNNERS = {
+    "small_steps": _run_small_steps,
+    "ramp": _run_ramp,
+    "sagIh": _run_sag_ih,
+    "hyperpol": _run_hyperpol,
+    "free_run": _run_free_run,
+}
+ALL_PROTOCOLS = list(PROTOCOL_RUNNERS)
+PROTOCOL_RANK = {p: i for i, p in enumerate(ALL_PROTOCOLS)}
+
+
+# ---------------------------------------------------------------------------
+# manifest loading and block grouping
+# ---------------------------------------------------------------------------
+
+def load_manifest(path: Path) -> pd.DataFrame:
+    """Read the long manifest, apply defaults, and drop excluded rows."""
+    df = pd.read_csv(path, dtype=str)
+
+    required = ["cell_id", "abf_file", "protocol"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise SystemExit(
+            f"Manifest {path} is missing required column(s): {missing}\n"
+            f"Expected the long schema: {MANIFEST_COLUMNS}\n"
+            "Convert a wide cell sheet with scripts/sheet_to_long.py."
+        )
+    for col in MANIFEST_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    for col in ("cell_id", "abf_folder", "abf_file", "protocol", "drug",
+                "concentration", "exclude", "notes"):
+        df[col] = df[col].map(_text)
+    df["condition"] = df["condition"].map(lambda v: _text(v) or DEFAULT_CONDITION)
+    df["seq"] = df["seq"].map(lambda v: int(float(_text(v))) if _text(v) else 0)
+
+    df = df[df["cell_id"] != ""]
+    excluded = df["exclude"] != ""
+    if excluded.any():
+        print(f"Manifest: {int(excluded.sum())} row(s) skipped via 'exclude'.")
+    return df[~excluded].reset_index(drop=True)
+
+
+def group_blocks(df: pd.DataFrame) -> list[tuple[tuple[str, int], pd.DataFrame]]:
+    """Group manifest rows into blocks, each sorted into execution order.
+
+    Returns ``[((cell_id, seq), rows), ...]`` ordered by cell then seq.
+    """
+    blocks: list[tuple[tuple[str, int], pd.DataFrame]] = []
+    for key, rows in df.groupby(["cell_id", "seq"], sort=True):
+        rows = rows.assign(
+            _rank=rows["protocol"].map(lambda p: PROTOCOL_RANK.get(p, 99))
+        ).sort_values(["_rank", "abf_file"]).drop(columns="_rank")
+        blocks.append((key, rows.reset_index(drop=True)))
+    blocks.sort(key=lambda kv: (kv[0][0], kv[0][1]))
+    return blocks
+
+
+def block_problems(rows: pd.DataFrame) -> list[str]:
+    """Manifest errors that make a block ambiguous. Reported, never raised."""
+    problems: list[str] = []
+
+    conditions = sorted(set(rows["condition"]))
+    if len(conditions) > 1:
+        problems.append(
+            f"condition is not constant within the block: {conditions} "
+            "(rows sharing a seq must share a condition)"
+        )
+
+    # Only protocols we can actually analyze matter here. A repeated SK_VC is
+    # just an unanalyzed pair; a repeated small_steps means a mis-entered seq.
+    analyzable = rows[rows["protocol"].isin(PROTOCOL_RUNNERS)]
+    counts = analyzable["protocol"].value_counts()
+    for protocol, n in counts[counts > 1].items():
+        files = list(analyzable.loc[analyzable["protocol"] == protocol, "abf_file"])
+        problems.append(
+            f"{protocol} appears {n}x in one block ({', '.join(files)}) -- "
+            "give the repeats different seq values"
+        )
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# per-block processing
 # ---------------------------------------------------------------------------
 
 def _warn_missing(cell_id: str, protocol: str, folder: str, filename: str) -> None:
@@ -310,178 +574,100 @@ def _warn_missing(cell_id: str, protocol: str, folder: str, filename: str) -> No
     )
 
 
-def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
-                 missing_accum: list[tuple]) -> dict:
-    cell_id = str(row["cell_id"]).strip()
-    abf_folder = "" if _blank(row.get("abf_folder")) else str(row["abf_folder"]).strip()
-    notes = "" if _blank(row.get("notes")) else str(row["notes"]).strip()
+def resolve_path(row: pd.Series, missing_accum: list[tuple]) -> tuple[Path | None, str | None]:
+    """Return (path, reason). ``path`` is None when the row can't be analyzed."""
+    cell_id, protocol = row["cell_id"], row["protocol"]
+    abf_file, abf_folder = row["abf_file"], row["abf_folder"]
+    if not abf_file:
+        return None, "no abf_file"
+    if not abf_folder:
+        _warn_missing(cell_id, protocol, "<blank abf_folder>", abf_file)
+        missing_accum.append((cell_id, protocol, "<blank abf_folder>", abf_file))
+        return None, "no abf_folder"
+    p = Path(abf_folder) / abf_file
+    if not p.exists():
+        _warn_missing(cell_id, protocol, abf_folder, abf_file)
+        missing_accum.append((cell_id, protocol, abf_folder, abf_file))
+        return None, "file not found"
+    return p, None
+
+
+def process_block(key: tuple[str, int], rows: pd.DataFrame, protocols: list[str],
+                  out_dir: Path, args, missing_accum: list[tuple]) -> dict:
+    cell_id, seq = key
+    condition = rows["condition"].iloc[0]
+    label = block_label(cell_id, condition, seq)
 
     status_row = {k: "" for k in BATCH_SUMMARY_COLUMNS}
     status_row["cell_id"] = cell_id
-    status_row["small_steps_file"] = (
-        "" if _blank(row.get("small_steps_file")) else str(row["small_steps_file"]).strip()
+    status_row["condition"] = condition
+    status_row["seq"] = seq
+    status_row["drug"] = next((v for v in rows["drug"] if v), "")
+    status_row["concentration"] = next((v for v in rows["concentration"] if v), "")
+    status_row["abf_files"] = ";".join(
+        f"{r['protocol']}={r['abf_file']}" for _, r in rows.iterrows()
     )
 
-    def resolve(protocol: str) -> tuple[Path | None, str | None]:
-        """Return (path, reason). path is None when the protocol can't run."""
-        raw = row.get(PROTOCOL_COLUMN[protocol])
-        val = "" if _blank(raw) else str(raw).strip()
-        if not val:
-            return None, "skipped"
-        if _looks_like_multi_file(val):
-            return None, "multi-file, skipped"
-        if not abf_folder:
-            _warn_missing(cell_id, protocol, "<blank abf_folder>", val)
-            missing_accum.append((cell_id, protocol, "<blank abf_folder>", val))
-            return None, "no abf_folder"
-        p = Path(abf_folder) / val
-        if not p.exists():
-            _warn_missing(cell_id, protocol, abf_folder, val)
-            missing_accum.append((cell_id, protocol, abf_folder, val))
-            return None, "file not found"
-        return p, None
-
-    cell = Cell(cell_id=cell_id, output_dir=out_dir, notes=notes)
-    ran: list[str] = []
     notes_by_protocol: dict[str, str] = {}
-    # protocol -> its run_spike_detection result data, one spike CSV each
-    spike_data_by_protocol: dict[str, dict] = {}
+    # Two different reasons a block can produce nothing, kept apart so a run
+    # that simply filtered a block out does not look like a failure.
+    has_runner = any(p in PROTOCOL_RUNNERS for p in rows["protocol"])
+    was_requested = any(
+        p in PROTOCOL_RUNNERS and p in protocols for p in rows["protocol"]
+    )
 
-    # ---- small_steps: Find Spikes + F-I Curve -----------------------------
-    # Runs first: its spike result must be captured before ramp detection
-    # appends another "spikes" entry, and analyze_fi_curve reads the latest one.
-    if "small_steps" in protocols:
-        p, reason = resolve("small_steps")
-        if p is None:
-            notes_by_protocol["small_steps"] = reason
-        else:
-            try:
-                rec = cell.add_recording(p)
-                name = rec.filename
-                epoch = args.epoch_index if args.epoch_index is not None else safe_find_step_epoch(p)
-                cell.create_sweep_collection(name, _all_sweeps(name, rec))
-                cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
-                                 peak_search_window_ms=args.peak_window, lowpass_hz=args.lowpass)
-                spike_data_by_protocol["small_steps"] = cell.results["spikes"][-1]["data"]
-                cell.analyze_fi_curve(name, epoch)
-                status_row["n_sweeps"] = rec.n_sweeps
-                status_row["epoch_index"] = epoch
-                ran.append("small_steps")
-            except Exception as exc:
-                traceback.print_exc()
-                notes_by_protocol["small_steps"] = f"error: {exc}"
+    problems = block_problems(rows)
+    if problems:
+        joined = "; ".join(problems)
+        print(f"    manifest problem: {joined}", file=sys.stderr)
+        status_row["protocol_status"] = joined
+        status_row["status"] = f"error: {joined}"
+        return status_row
 
-            # AHP: same current-step collection / epoch as the F-I curve, no
-            # spike detection required (trace_viewer._run_ahp_analysis). Own
-            # try/except so an AHP failure doesn't undo the F-I result.
-            if "small_steps" in ran:
-                try:
-                    cell.analyze_ahp(name, epoch)  # GUI defaults: 2 kHz, 100/1000 ms
-                    ran.append("ahp")
-                except Exception as exc:
-                    traceback.print_exc()
-                    notes_by_protocol["ahp"] = f"error: {exc}"
+    notes = next((v for v in rows["notes"] if v), "")
+    cell = Cell(cell_id=cell_id, output_dir=out_dir, notes=notes,
+                metadata={"condition": condition, "seq": seq,
+                          "drug": status_row["drug"],
+                          "concentration": status_row["concentration"],
+                          "abf_files": status_row["abf_files"]})
+    ctx = BlockContext(args)
+    ran: list[str] = []
 
-    # ---- ramp: Find Spikes (same params) + Analyze Ramp APs ---------------
-    if "ramp" in protocols:
-        p, reason = resolve("ramp")
-        if p is None:
-            notes_by_protocol["ramp"] = reason
-        else:
-            try:
-                rec = cell.add_recording(p)
-                name = rec.filename
-                epoch = safe_find_step_epoch(p)
-                cell.create_sweep_collection(name, _all_sweeps(name, rec))
-                cell.find_spikes(name, epoch, dvdt_detection_mVms=args.dvdt,
-                                 peak_search_window_ms=args.peak_window,
-                                 lowpass_hz=args.lowpass)
-                spike_data_by_protocol["ramp"] = cell.results["spikes"][-1]["data"]
-                result = run_ramp_analysis(
-                    cell.collections[name], epoch, cell.results["spikes"][-1],
-                    lowpass_hz=args.lowpass,
-                )
-                cell._store_result("ramp_evoked_APs", result, {
-                    "collection_name": name, "epoch_index": epoch,
-                    "source": "batch_intrinsic",
-                })
-                ran.append("ramp")
-            except Exception as exc:
-                traceback.print_exc()
-                notes_by_protocol["ramp"] = f"error: {exc}"
+    for _, row in rows.iterrows():
+        protocol = row["protocol"]
+        runner = PROTOCOL_RUNNERS.get(protocol)
+        if runner is None:
+            notes_by_protocol[protocol] = "no analyzer"
+            continue
+        if protocol not in protocols:
+            notes_by_protocol[protocol] = "not requested"
+            continue
+        path, reason = resolve_path(row, missing_accum)
+        if path is None:
+            notes_by_protocol[protocol] = reason
+            continue
+        try:
+            ran.extend(runner(cell, path, ctx))
+        except Exception as exc:  # noqa: BLE001 - one protocol must not sink the block
+            traceback.print_exc()
+            notes_by_protocol[protocol] = f"error: {exc}"
 
-    # ---- sagIh: Analyze Each Sweep (Passive) -----------------------------
-    if "sagIh" in protocols:
-        p, reason = resolve("sagIh")
-        if p is None:
-            notes_by_protocol["sagIh"] = reason
-        else:
-            try:
-                rec = cell.add_recording(p)
-                name = rec.filename
-                epoch = safe_find_step_epoch(p)
-                cell.create_sweep_collection(name, _all_sweeps(name, rec))
-                cell.analyze_passive(name, epoch)  # stores "passive_range"
-                ran.append("sagIh")
-            except Exception as exc:
-                traceback.print_exc()
-                notes_by_protocol["sagIh"] = f"error: {exc}"
+    notes_by_protocol.update(ctx.errors)
 
-    # ---- hyperpol: Average & Analyze Subthreshold -----------------------
-    if "hyperpol" in protocols:
-        p, reason = resolve("hyperpol")
-        if p is None:
-            notes_by_protocol["hyperpol"] = reason
-        else:
-            try:
-                rec = cell.add_recording(p)
-                name = rec.filename
-                epoch = safe_find_step_epoch(p)
-                cell.create_sweep_collection(name, _all_sweeps(name, rec))
-                result = run_average_subthreshold(cell, name, epoch, lowpass_hz=args.lowpass)
-                cell._store_result("passive_repeated_step", result, {
-                    "collection_name": name, "epoch_index": epoch,
-                    "n_sweeps_averaged": result["n_sweeps_averaged"],
-                    "source": "batch_intrinsic",
-                })
-                ran.append("hyperpol")
-            except Exception as exc:
-                traceback.print_exc()
-                notes_by_protocol["hyperpol"] = f"error: {exc}"
-
-    # ---- free_run: Measure V_rest --------------------------------------
-    if "free_run" in protocols:
-        p, reason = resolve("free_run")
-        if p is None:
-            notes_by_protocol["free_run"] = reason
-        else:
-            try:
-                rec = cell.add_recording(p)
-                name = rec.filename
-                cell.create_sweep_collection(name, _all_sweeps(name, rec))
-                result = run_vrest_analysis(
-                    cell.collections[name], lowpass_hz=args.lowpass,
-                    dvdt_detection_mVms=args.dvdt,
-                    peak_search_window_ms=args.peak_window,
-                )
-                if result.get("spike_detection") is not None:
-                    spike_data_by_protocol["free_run"] = result["spike_detection"]
-                cell._store_result("v_rest", result, {
-                    "collection_name": name, "source": "batch_intrinsic",
-                })
-                ran.append("free_run")
-            except Exception as exc:
-                traceback.print_exc()
-                notes_by_protocol["free_run"] = f"error: {exc}"
+    # Earliest acquisition time across the files that actually loaded. This is
+    # the block's position on the experiment clock.
+    times = [r.recorded_at for r in cell.recordings.values() if r.recorded_at is not None]
+    if times:
+        status_row["recorded_at"] = min(times).isoformat()
 
     # ---- exports -------------------------------------------------------
     # One spike table per protocol that ran Find Spikes. n_spikes_total keeps
-    # its established meaning (small_steps count) so batch_summary.csv stays
+    # its established meaning (small_steps count) so the feature columns stay
     # comparable with earlier runs.
     written_csvs: list[str] = []
-    for protocol, spike_data in spike_data_by_protocol.items():
+    for protocol, spike_data in ctx.spike_data.items():
         spike_df = build_spike_table(spike_data)
-        spikes_csv = out_dir / f"{cell_id}_spikes_{protocol}.csv"
+        spikes_csv = out_dir / f"{label}_spikes_{protocol}.csv"
         spike_df.to_csv(spikes_csv, index=False)
         written_csvs.append(str(spikes_csv))
         if protocol == "small_steps":
@@ -489,59 +675,174 @@ def process_cell(row: pd.Series, protocols: list[str], out_dir: Path, args,
     if written_csvs:
         status_row["spikes_csv"] = ";".join(written_csvs)
 
-    summary_json = out_dir / f"{cell_id}_cell_summary.json"
+    summary_json = out_dir / f"{label}_cell_summary.json"
     summary = cell.export_cell_summary(filepath=summary_json)
     status_row["summary_json"] = str(summary_json)
     status_row.update(flatten_cell_level(summary))
 
+    status_row["n_sweeps"] = ctx.stats.get("n_sweeps", "")
+    status_row["epoch_index"] = ctx.stats.get("epoch_index", "")
     status_row["protocols_run"] = ",".join(ran)
     status_row["protocol_status"] = ", ".join(
         f"{k}: {v}" for k, v in notes_by_protocol.items()
     )
-    status_row["status"] = "ok" if ran else "error: no protocol produced a result"
+    if ran:
+        status_row["status"] = "ok"
+    elif not has_runner:
+        # Every row here is a protocol we have no analyzer for (today, the
+        # voltage-clamp SK_VC files). Nothing went wrong -- there was simply
+        # nothing to analyze, and calling that an error would bury the blocks
+        # that really did fail.
+        status_row["status"] = "skipped: no analyzable protocol"
+    elif not was_requested:
+        status_row["status"] = "skipped: no requested protocol in this block"
+    else:
+        status_row["status"] = "error: no protocol produced a result"
     return status_row
+
+
+def add_elapsed_minutes(rows: list[dict]) -> list[str]:
+    """Fill ``minutes_from_first`` and flag seq/clock disagreements.
+
+    The manifest's ``seq`` is authoritative for ordering; the ABF clock is the
+    independent check on it. A cell whose blocks were acquired in a different
+    order than the manifest claims is almost always a data-entry error, so it
+    is worth saying out loud -- but not worth refusing to analyze.
+    """
+    warnings: list[str] = []
+    by_cell: dict[str, list[dict]] = {}
+    for row in rows:
+        by_cell.setdefault(row["cell_id"], []).append(row)
+
+    for cell_id, cell_rows in by_cell.items():
+        ordered = sorted(cell_rows, key=lambda r: r["seq"] if r["seq"] != "" else 0)
+        timed = [r for r in ordered if r["recorded_at"]]
+        if not timed:
+            continue
+        ref = pd.Timestamp(timed[0]["recorded_at"])
+        for row in timed:
+            delta = (pd.Timestamp(row["recorded_at"]) - ref).total_seconds() / 60.0
+            row["minutes_from_first"] = round(delta, 2)
+        clock_order = sorted(timed, key=lambda r: r["recorded_at"])
+        if [r["seq"] for r in clock_order] != [r["seq"] for r in timed]:
+            warnings.append(
+                f"{cell_id}: seq order {[r['seq'] for r in timed]} disagrees with "
+                f"acquisition order {[r['seq'] for r in clock_order]}"
+            )
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# validation mode
+# ---------------------------------------------------------------------------
+
+def validate(blocks, protocols: list[str]) -> int:
+    """Check the manifest without loading sample data. Returns an exit code."""
+    n_errors = n_warnings = 0
+    missing: list[str] = []
+    no_analyzer: dict[str, int] = {}
+
+    for (cell_id, seq), rows in blocks:
+        condition = rows["condition"].iloc[0]
+        prefix = f"{cell_id}  seq={seq}  ({condition})"
+        for msg in block_problems(rows):
+            print(f"ERROR    {prefix}: {msg}")
+            n_errors += 1
+        for _, row in rows.iterrows():
+            protocol = row["protocol"]
+            if protocol not in PROTOCOL_RUNNERS:
+                no_analyzer[protocol] = no_analyzer.get(protocol, 0) + 1
+                continue
+            if protocol not in protocols:
+                continue
+            folder, name = row["abf_folder"], row["abf_file"]
+            if not folder or not (Path(folder) / name).exists():
+                missing.append(f"{prefix}  {protocol}: {folder}\\{name}")
+
+    # seq vs. acquisition order, from headers only
+    for cell_id, cell_blocks in _by_cell(blocks).items():
+        stamped = []
+        for (_, seq), rows in cell_blocks:
+            times = []
+            for _, row in rows.iterrows():
+                if row["protocol"] not in PROTOCOL_RUNNERS:
+                    continue
+                p = Path(row["abf_folder"]) / row["abf_file"] if row["abf_folder"] else None
+                if p is not None and p.exists():
+                    t = peek_recorded_at(p)
+                    if t is not None:
+                        times.append(t)
+            if times:
+                stamped.append((seq, min(times)))
+        if len(stamped) > 1:
+            if [s for s, _ in stamped] != [s for s, _ in sorted(stamped, key=lambda x: x[1])]:
+                print(f"WARNING  {cell_id}: seq order disagrees with ABF acquisition order "
+                      f"({[(s, t.isoformat()) for s, t in stamped]})")
+                n_warnings += 1
+
+    if missing:
+        print(f"\n=== {len(missing)} file(s) not found ===")
+        for line in missing:
+            print(f"  {line}")
+    if no_analyzer:
+        print("\n=== protocols with no analyzer (rows ignored) ===")
+        for protocol, n in sorted(no_analyzer.items()):
+            print(f"  {protocol}: {n} row(s)")
+
+    n_blocks = len(blocks)
+    n_cells = len({c for (c, _), _ in blocks})
+    print(f"\n{n_blocks} block(s) across {n_cells} cell(s)  |  "
+          f"{n_errors} error(s), {n_warnings} warning(s), {len(missing)} missing file(s)")
+    return 1 if n_errors else 0
+
+
+def _by_cell(blocks) -> dict:
+    out: dict = {}
+    for key, rows in blocks:
+        out.setdefault(key[0], []).append((key, rows))
+    return out
 
 
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
-def select_rows(sheet: pd.DataFrame, cells: list[str] | None, limit: int) -> pd.DataFrame:
-    if "cell_id" not in sheet.columns:
-        raise SystemExit("Sheet has no 'cell_id' column.")
-
+def select_blocks(blocks, cells: list[str] | None, conditions: list[str] | None,
+                  limit: int):
+    """Filter blocks by cell_id / condition, then apply --limit."""
     if cells:
-        missing = [c for c in cells if c not in set(sheet["cell_id"])]
-        if missing:
-            raise SystemExit(f"cell_id(s) not found in sheet: {missing}")
-        rows = sheet[sheet["cell_id"].isin(cells)].copy()
-        rows["_order"] = rows["cell_id"].map({c: i for i, c in enumerate(cells)})
-        return rows.sort_values("_order").drop(columns="_order")
-
-    # Default: any row with an abf_folder and at least one named protocol file.
-    protocol_cols = [c for c in PROTOCOL_COLUMN.values() if c in sheet.columns]
-    if not protocol_cols:
-        raise SystemExit(f"Sheet has none of the protocol columns: {list(PROTOCOL_COLUMN.values())}")
-    has_folder = ~sheet.get("abf_folder", pd.Series("", index=sheet.index)).map(_blank)
-    blank_mask = sheet[protocol_cols].apply(lambda col: col.map(_blank))
-    has_any_file = ~blank_mask.all(axis=1)
-    rows = sheet[has_folder & has_any_file].copy()
+        known = {key[0] for key, _ in blocks}
+        unknown = [c for c in cells if c not in known]
+        if unknown:
+            raise SystemExit(f"cell_id(s) not found in manifest: {unknown}")
+        order = {c: i for i, c in enumerate(cells)}
+        blocks = [b for b in blocks if b[0][0] in order]
+        blocks.sort(key=lambda kv: (order[kv[0][0]], kv[0][1]))
+    if conditions:
+        wanted = set(conditions)
+        blocks = [b for b in blocks if b[1]["condition"].iloc[0] in wanted]
+        if not blocks:
+            raise SystemExit(f"No blocks match --conditions {conditions}")
     if limit and limit > 0:
-        return rows.head(limit)
-    return rows
+        blocks = blocks[:limit]
+    return blocks
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--sheet", type=Path, default=REPO_ROOT / "scripts" / "cells_forsberg.csv",
-                        help="CSV snapshot of the cell sheet (default: scripts/cells_forsberg.csv)")
+    parser.add_argument("--sheet", type=Path, default=REPO_ROOT / "scripts" / "recordings.csv",
+                        help="Long recordings manifest (default: scripts/recordings.csv)")
     parser.add_argument("--protocols", default=",".join(ALL_PROTOCOLS),
                         help="Comma list from: " + ",".join(ALL_PROTOCOLS) + " (default: all)")
     parser.add_argument("--cells", default="",
-                        help="Comma-separated cell_id list. Overrides --limit.")
+                        help="Comma-separated cell_id list. Overrides --limit ordering.")
+    parser.add_argument("--conditions", default="",
+                        help="Comma-separated condition list (e.g. baseline,apamin)")
     parser.add_argument("--limit", type=int, default=3,
-                        help="First N rows with a non-empty small_steps_file (default: 3; 0 = no limit)")
+                        help="First N blocks (default: 3; 0 = no limit)")
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Check the manifest and file paths without analyzing")
     parser.add_argument("--dvdt", type=float, default=3.0,
                         help="dV/dt detection threshold, mV/ms (default: 3.0)")
     parser.add_argument("--peak-window", type=float, default=10.0,
@@ -560,33 +861,45 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"Unknown --protocols: {unknown}. Valid: {ALL_PROTOCOLS}")
 
     if not args.sheet.exists():
-        raise SystemExit(f"Sheet not found: {args.sheet}")
+        raise SystemExit(
+            f"Manifest not found: {args.sheet}\n"
+            "Generate one from the wide cell sheet:\n"
+            "    python scripts/sheet_to_long.py --sheet scripts/cells_forsberg.csv"
+        )
+
+    manifest = load_manifest(args.sheet)
+    cells = [c.strip() for c in args.cells.split(",") if c.strip()] or None
+    conditions = [c.strip() for c in args.conditions.split(",") if c.strip()] or None
+    blocks = select_blocks(group_blocks(manifest), cells, conditions, args.limit)
+    if not blocks:
+        raise SystemExit("No matching blocks to process.")
+
+    if args.validate_only:
+        print(f"Validating {args.sheet}  |  protocols={protocols}\n")
+        return validate(blocks, protocols)
 
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    sheet = pd.read_csv(args.sheet, dtype=str)
-    cells = [c.strip() for c in args.cells.split(",") if c.strip()] or None
-    rows = select_rows(sheet, cells, args.limit)
-    if rows.empty:
-        raise SystemExit("No matching cells to process.")
-
     print(f"Batch intrinsic analysis  |  protocols={protocols}  "
           f"dvdt={args.dvdt} mV/ms  peak_window={args.peak_window} ms")
     print(f"Output: {out_dir}")
-    print(f"Cells: {list(rows['cell_id'])}\n")
+    print(f"Blocks: {len(blocks)} across {len({k[0] for k, _ in blocks})} cell(s)\n")
 
     results: list[dict] = []
     missing_accum: list[tuple] = []
-    for _, row in rows.iterrows():
-        cell_id = str(row["cell_id"]).strip()
-        print(f"--- {cell_id} ---")
+    for key, rows in blocks:
+        cell_id, seq = key
+        condition = rows["condition"].iloc[0]
+        print(f"--- {cell_id}  seq={seq}  ({condition}) ---")
         try:
-            status_row = process_cell(row, protocols, out_dir, args, missing_accum)
+            status_row = process_block(key, rows, protocols, out_dir, args, missing_accum)
         except Exception as exc:  # noqa: BLE001 - keep the batch going
             traceback.print_exc()
             status_row = {k: "" for k in BATCH_SUMMARY_COLUMNS}
             status_row["cell_id"] = cell_id
+            status_row["condition"] = condition
+            status_row["seq"] = seq
             status_row["status"] = f"error: {exc}"
         results.append(status_row)
         extra = ""
@@ -597,13 +910,21 @@ def main(argv: list[str] | None = None) -> int:
                 extra += f"  ({status_row['protocol_status']})"
         print(f"    {status_row['status']}{extra}")
 
+    order_warnings = add_elapsed_minutes(results)
+
     summary_df = pd.DataFrame(results, columns=BATCH_SUMMARY_COLUMNS)
     batch_csv = out_dir / "batch_summary.csv"
     summary_df.to_csv(batch_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
     print("\n=== batch summary ===")
-    print(summary_df[["cell_id", "n_sweeps", "epoch_index", "n_spikes_total",
-                      "protocols_run", "status"]].to_string(index=False))
+    print(summary_df[["cell_id", "condition", "seq", "minutes_from_first",
+                      "n_sweeps", "n_spikes_total", "protocols_run",
+                      "status"]].to_string(index=False))
+
+    if order_warnings:
+        print(f"\n=== {len(order_warnings)} cell(s) where seq disagrees with the ABF clock ===")
+        for line in order_warnings:
+            print(f"  {line}")
 
     if missing_accum:
         print(f"\n=== {len(missing_accum)} file(s) not found ===")
@@ -612,8 +933,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nWrote {batch_csv}")
     n_ok = int((summary_df["status"] == "ok").sum())
+    n_skip = int(summary_df["status"].str.startswith("skipped").sum())
     n_err = int(summary_df["status"].str.startswith("error").sum())
-    print(f"{n_ok} ok, {n_err} error  ({len(missing_accum)} missing file warnings)")
+    print(f"{n_ok} ok, {n_skip} skipped, {n_err} error  "
+          f"({len(missing_accum)} missing file warnings)")
     return 1 if n_err else 0
 
 
