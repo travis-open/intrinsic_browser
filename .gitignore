@@ -13,3 +13,10 @@ test_*.py
 notebooks/
 test_output/
 test_outputs/
+
+# Cell sheets and the manifests generated from them. These carry local lab
+# metadata -- absolute Box paths, mouse IDs, per-cell QC verdicts -- and are
+# exports of a Google Sheet, so the sheet is the source of truth, not git.
+# Regenerate the long manifest with scripts/sheet_to_long.py.
+scripts/cells*.csv
+scripts/recordings.csv
